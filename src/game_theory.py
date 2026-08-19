@@ -81,14 +81,10 @@ def _headline(state: str, ls, lc, ss, sc) -> str:
         return "SHORTS LOOK SQUEEZED (price up, OI down, short liqs) — could also be voluntary short covering."
     if state == "SHORT SQUEEZE":
         return "LONGS LOOK SQUEEZED (price down, OI down, long liqs) — could also be voluntary long covering."
-    if "LONG TRAP" in state and lc >= 65:
-        return "LONGS ARE CURRENTLY VULNERABLE — and adverse flow is showing up."
     if "LONG TRAP" in state:
-        return "LONGS APPEAR VULNERABLE — setup only; trap is NOT confirmed."
-    if "SHORT TRAP" in state and sc >= 65:
-        return "SHORTS ARE CURRENTLY VULNERABLE — and adverse flow is showing up."
+        return "LONG-SIDE VULNERABILITY (setup). Confirmed only if structure+flow GATE is true — not via confirm score."
     if "SHORT TRAP" in state:
-        return "SHORTS APPEAR VULNERABLE — setup only; trap is NOT confirmed."
+        return "SHORT-SIDE VULNERABILITY (setup). Confirmed only if structure+flow GATE is true — not via confirm score."
     if "BUY ABSORPTION" in state:
         return "AGGRESSIVE BUYING IS NOT MOVING PRICE MUCH — possible seller absorption."
     if "SELL ABSORPTION" in state:
@@ -97,10 +93,10 @@ def _headline(state: str, ls, lc, ss, sc) -> str:
         return "BREAKOUT FAILED — range high was traded and rejected."
     if "FAILED BREAKDOWN" in state:
         return "BREAKDOWN FAILED — range low was traded and rejected."
-    if "LONG ACCUMULATION" in state:
-        return "ESTIMATED LONG-SIDE CROWDING — not proof of who holds OI."
-    if "SHORT ACCUMULATION" in state:
-        return "ESTIMATED SHORT-SIDE CROWDING — not proof of who holds OI."
+    if "LONG-SIDE CROWDING" in state:
+        return "LONG-SIDE CROWDING ESTIMATE — funding/account-ratio PROXY, not actual long OI."
+    if "SHORT-SIDE CROWDING" in state:
+        return "SHORT-SIDE CROWDING ESTIMATE — funding/account-ratio PROXY, not actual short OI."
     return "NO SIDE IS CLEARLY FORCED. Neutral / mixed evidence."
 
 

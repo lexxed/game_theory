@@ -86,16 +86,16 @@ class ScoreEngine:
             ls_n = clip((ls - 1.0) / 1.0)
             raw = 0.65 * fund_n + 0.35 * ls_n
             reason = (
-                f"ESTIMATED crowding: funding percentile {fund_pct:.0f}, "
-                f"global account LS ratio {ls:.3f} (not actual long OI)"
+                f"CROWDING PROXY (not OI split): funding percentile {fund_pct:.0f}, "
+                f"advertised account LS ratio {ls:.3f} — not actual long/short positioning"
             )
         else:
             fund_n = clip((50.0 - fund_pct) / 50.0)
             ls_n = clip((1.0 - ls) / 1.0)
             raw = 0.65 * fund_n + 0.35 * ls_n
             reason = (
-                f"ESTIMATED crowding: funding percentile {fund_pct:.0f} (low favors shorts), "
-                f"global account LS ratio {ls:.3f}"
+                f"CROWDING PROXY (not OI split): funding percentile {fund_pct:.0f} (low = short-side proxy), "
+                f"advertised account LS ratio {ls:.3f} — not actual short positioning"
             )
         if s.get("ls_account_ratio") is None:
             raw *= 0.7
@@ -128,10 +128,16 @@ class ScoreEngine:
         href = float(refs.get("funding_high", 0.0005))
         if side == "long":
             raw = clip(0.5 * clip(fund / href) + 0.5 * clip((fund_pct - 50) / 50))
-            reason = f"funding {fund:.6f} ({fund*100:.4f}%), percentile {fund_pct:.0f}"
+            reason = (
+                f"funding PROXY {fund:.6f} ({fund*100:.4f}%), percentile {fund_pct:.0f} "
+                "— payment between longs/shorts, not proof of positioning"
+            )
         else:
             raw = clip(0.5 * clip((-fund) / href) + 0.5 * clip((50 - fund_pct) / 50))
-            reason = f"funding {fund:.6f} (negative favors short crowding), percentile {fund_pct:.0f}"
+            reason = (
+                f"funding PROXY {fund:.6f} (negative = short-side payment proxy), percentile {fund_pct:.0f} "
+                "— not proof of short OI"
+            )
         comps.append(_comp("funding", fund, raw, w.get("funding", 10), reason))
 
         # --- CVD divergence ---
@@ -320,26 +326,23 @@ class ScoreEngine:
         oi15 = float(s.get("oi_chg_15m_pct") or 0.0)
         px5 = float(s.get("price_chg_5m_pct") or 0.0)
         cvd5 = float(s.get("cvd_chg_5m") or 0.0)
-        liq = s.get("liq_5m") or {}
-        liq_ref = float(get("scoring_refs.liq_notional_ref", 250000))
         oi_ref = float(refs.get("oi_drop_ref_pct", 0.35))
 
-        def side_score(price_down: bool, long_liq: bool) -> float:
+        def side_score(price_down: bool) -> float:
+            # Intensity from price / OI / CVD only. Observed liq is a GATE, not this score.
             px_ok = (px5 < 0) if price_down else (px5 > 0)
             cvd_ok = (cvd5 < 0) if price_down else (cvd5 > 0)
             oi_ok = oi15 < 0
-            notion = float(liq.get("long_notional" if long_liq else "short_notional") or 0.0)
             parts = [
-                0.25 * (1.0 if px_ok else 0.0),
-                0.25 * clip(abs(oi15) / oi_ref) if oi_ok else 0.0,
-                0.30 * clip(notion / liq_ref),
-                0.20 * (1.0 if cvd_ok else 0.0),
+                0.40 * (1.0 if px_ok else 0.0),
+                0.35 * clip(abs(oi15) / oi_ref) if oi_ok else 0.0,
+                0.25 * (1.0 if cvd_ok else 0.0),
             ]
             return round(100.0 * sum(parts), 2)
 
         return {
-            "long": side_score(price_down=True, long_liq=True),
-            "short": side_score(price_down=False, long_liq=False),
+            "long": side_score(price_down=True),
+            "short": side_score(price_down=False),
         }
 
     def _squeeze(self, s: dict) -> dict:

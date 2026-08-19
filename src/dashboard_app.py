@@ -71,6 +71,13 @@ def format_copy_snapshot(snap: dict, symbol_override: str = "") -> str:
         *card_lines("SHORT TRAP SETUP", sc.get("short_setup") or {}),
         *card_lines("SHORT TRAP CONFIRM", sc.get("short_confirm") or {}),
         "",
+        f"TRADE STATUS        {(snap.get('trade_status') or (sc.get('gates') or {}).get('trade_status'))}",
+        f"LONG VULN/CONF/FF   {(sc.get('gates') or {}).get('long_vulnerability')} / "
+        f"{(sc.get('gates') or {}).get('long_trap_confirmation')} / "
+        f"{(sc.get('gates') or {}).get('long_forced_flow')}",
+        f"SHORT VULN/CONF/FF  {(sc.get('gates') or {}).get('short_vulnerability')} / "
+        f"{(sc.get('gates') or {}).get('short_trap_confirmation')} / "
+        f"{(sc.get('gates') or {}).get('short_forced_flow')}",
         f"CASCADE long/short  {sc.get('cascade_long')} / {sc.get('cascade_short')}",
         f"SQUEEZE  {sc.get('squeeze')}",
         f"CVD DIV  {div.get('reason')}",
@@ -97,6 +104,32 @@ def _to_clipboard(text: str) -> str:
         return "Copied to Windows clipboard. Also shown below."
     except Exception:
         return "Clipboard helper failed. Select the text below and Ctrl+C."
+
+
+def _yn(flag: bool) -> str:
+    return "YES" if flag else "NO"
+
+
+def _gates_html(s: dict) -> str:
+    g = s.get("gates") or (s.get("scores") or {}).get("gates") or {}
+    status = s.get("trade_status") or g.get("trade_status") or "WAIT"
+    return f"""
+    <div style="font-family:Segoe UI,system-ui,sans-serif;margin:8px 0">
+      {_card("TRADE STATUS", status)}
+      <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:8px">
+        {_card("LONG VULNERABILITY", f"{g.get('long_vulnerability', 0):.0f}/100")}
+        {_card("LONG TRAP CONFIRMATION", _yn(bool(g.get('long_trap_confirmation'))))}
+        {_card("LONG FORCED-FLOW", _yn(bool(g.get('long_forced_flow'))))}
+        {_card("SHORT VULNERABILITY", f"{g.get('short_vulnerability', 0):.0f}/100")}
+        {_card("SHORT TRAP CONFIRMATION", _yn(bool(g.get('short_trap_confirmation'))))}
+        {_card("SHORT FORCED-FLOW", _yn(bool(g.get('short_forced_flow'))))}
+      </div>
+      <div style="font-size:11px;color:#555;margin-top:6px">
+        Confirmation is a structure+flow GATE. Confirm score is diagnostic only.
+        Crowding is a PROXY, not OI positioning. Analysis only — no orders.
+      </div>
+    </div>
+    """
 
 
 def _kpi_html(s: dict) -> str:
@@ -291,6 +324,7 @@ class Dashboard:
         )
         self.health = W.HTML()
         self.kpis = W.HTML()
+        self.gates_box = W.HTML()
         self.long_box = W.HTML()
         self.short_box = W.HTML()
         self.game = W.HTML()
@@ -341,6 +375,7 @@ class Dashboard:
                 controls,
                 self.health,
                 self.kpis,
+                self.gates_box,
                 self.copy_box,
                 scores,
                 W.HTML("<h3>Game-theory panel</h3>"),
@@ -448,6 +483,7 @@ class Dashboard:
         snap = self.engine.snapshot()
         self.health.value = _health_html(snap.get("health") or {})
         self.kpis.value = _kpi_html(snap)
+        self.gates_box.value = _gates_html(snap)
         sc = snap["scores"]
         st = snap["state"]
         self.long_box.value = _score_html("LONG TRAP", sc.get("long_setup") or {}, sc.get("long_confirm") or {}, st)

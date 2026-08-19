@@ -5,11 +5,12 @@ from __future__ import annotations
 import time
 
 from config import get
+from src.gates import evaluate as evaluate_gates
 
 STATES = [
     "NEUTRAL",
-    "LONG ACCUMULATION / CROWDING",
-    "SHORT ACCUMULATION / CROWDING",
+    "LONG-SIDE CROWDING ESTIMATE",
+    "SHORT-SIDE CROWDING ESTIMATE",
     "POTENTIAL LONG TRAP",
     "POTENTIAL SHORT TRAP",
     "BUY ABSORPTION",
@@ -71,47 +72,43 @@ class StateMachine:
     def _candidate(self, scores: dict, snap: dict, cfg: dict) -> tuple[str, str]:
         setup_e = float(cfg.get("setup_enter", 70))
         setup_x = float(cfg.get("setup_exit", 55))
-        conf_e = float(cfg.get("confirm_enter", 65))
         abs_e = float(cfg.get("absorption_enter", 60))
         crowd_e = float(cfg.get("crowding_enter", 60))
-        cas_e = float(get("cascade.enter", 70))
         cas_x = float(get("cascade.exit", 50))
 
+        gates = scores.get("gates") or evaluate_gates(snap, scores)
         ls = scores["long_setup"]["total"]
         ss = scores["short_setup"]["total"]
-        lc = scores["long_confirm"]["total"]
-        sc = scores["short_confirm"]["total"]
         cl = scores["cascade_long"]
         cs = scores["cascade_short"]
         sq = scores.get("squeeze") or {}
         ab = snap.get("absorption") or {}
         st = snap.get("structure") or {}
 
-        # cascades
-        if cl >= cas_e:
-            return "LONG LIQUIDATION CASCADE", f"cascade_long={cl:.0f}"
-        if cs >= cas_e:
-            return "SHORT LIQUIDATION CASCADE", f"cascade_short={cs:.0f}"
+        # Cascades require observed liquidation (gate), not intensity alone.
+        if gates.get("long_cascade"):
+            return "LONG LIQUIDATION CASCADE", "observed long liq above threshold + cascade intensity"
+        if gates.get("short_cascade"):
+            return "SHORT LIQUIDATION CASCADE", "observed short liq above threshold + cascade intensity"
 
-        # stay in cascade until exit
-        if self.state == "LONG LIQUIDATION CASCADE" and cl >= cas_x:
+        if self.state == "LONG LIQUIDATION CASCADE" and gates.get("long_cascade"):
             return self.state, "cascade still active"
-        if self.state == "SHORT LIQUIDATION CASCADE" and cs >= cas_x:
+        if self.state == "SHORT LIQUIDATION CASCADE" and gates.get("short_cascade"):
             return self.state, "cascade still active"
-
-        if self.state in ("LONG LIQUIDATION CASCADE", "SHORT LIQUIDATION CASCADE") and cl < cas_x and cs < cas_x:
-            return "CASCADE EXHAUSTION", "cascade intensity fell through exit threshold"
+        if self.state in ("LONG LIQUIDATION CASCADE", "SHORT LIQUIDATION CASCADE"):
+            if cl < cas_x and cs < cas_x:
+                return "CASCADE EXHAUSTION", "cascade intensity fell through exit threshold"
 
         if sq.get("long_squeeze"):
             return "LONG SQUEEZE", sq.get("reason", "short covering / short liqs")
         if sq.get("short_squeeze"):
             return "SHORT SQUEEZE", sq.get("reason", "long covering / long liqs")
 
-        # confirmed traps
-        if ls >= setup_e and lc >= conf_e:
-            return "POTENTIAL LONG TRAP", f"setup {ls:.0f} + confirm {lc:.0f} (adverse flow occurring)"
-        if ss >= setup_e and sc >= conf_e:
-            return "POTENTIAL SHORT TRAP", f"setup {ss:.0f} + confirm {sc:.0f} (adverse flow occurring)"
+        # Confirm score is NOT used as a trap-confirmed signal.
+        if gates.get("long_trap_confirmation") and ls >= setup_x:
+            return "POTENTIAL LONG TRAP", "structure+flow GATE met (confirm score ignored)"
+        if gates.get("short_trap_confirmation") and ss >= setup_x:
+            return "POTENTIAL SHORT TRAP", "structure+flow GATE met (confirm score ignored)"
 
         if st.get("failed_breakout") and ls >= setup_x:
             return "FAILED BREAKOUT", "range high taken out then rejected"
@@ -124,16 +121,16 @@ class StateMachine:
             return "SELL ABSORPTION", ab.get("reason", "sell absorption")
 
         if ls >= setup_e:
-            return "POTENTIAL LONG TRAP", f"setup {ls:.0f}, confirmation only {lc:.0f}"
+            return "POTENTIAL LONG TRAP", f"vulnerability {ls:.0f}/100 — NOT a confirmed trap"
         if ss >= setup_e:
-            return "POTENTIAL SHORT TRAP", f"setup {ss:.0f}, confirmation only {sc:.0f}"
+            return "POTENTIAL SHORT TRAP", f"vulnerability {ss:.0f}/100 — NOT a confirmed trap"
 
         crowd_long = next((c for c in scores["long_setup"]["components"] if c["name"] == "crowding"), None)
         crowd_short = next((c for c in scores["short_setup"]["components"] if c["name"] == "crowding"), None)
         if crowd_long and crowd_long["normalized"] * 100 >= crowd_e and ls > ss:
-            return "LONG ACCUMULATION / CROWDING", crowd_long["reason"]
+            return "LONG-SIDE CROWDING ESTIMATE", crowd_long["reason"]
         if crowd_short and crowd_short["normalized"] * 100 >= crowd_e and ss > ls:
-            return "SHORT ACCUMULATION / CROWDING", crowd_short["reason"]
+            return "SHORT-SIDE CROWDING ESTIMATE", crowd_short["reason"]
 
         return "NEUTRAL", "no combination cleared enter thresholds"
 
@@ -151,8 +148,8 @@ def _priority(state: str) -> int:
         "FAILED BREAKDOWN": 50,
         "BUY ABSORPTION": 40,
         "SELL ABSORPTION": 40,
-        "LONG ACCUMULATION / CROWDING": 20,
-        "SHORT ACCUMULATION / CROWDING": 20,
+        "LONG-SIDE CROWDING ESTIMATE": 20,
+        "SHORT-SIDE CROWDING ESTIMATE": 20,
         "NEUTRAL": 0,
     }
     return order.get(state, 0)

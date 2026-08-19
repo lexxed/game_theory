@@ -15,6 +15,7 @@ from src.cvd import CVDEngine
 from src.footprint import FootprintEngine
 from src.funding import FundingTracker
 from src.game_theory import interpret
+from src.gates import evaluate as evaluate_gates
 from src.liquidations import LiquidationTracker
 from src.oi import OpenInterestTracker
 from src.price_structure import PriceStructure
@@ -360,6 +361,7 @@ class MarketSession:
     def _recompute(self) -> None:
         snap = self._features()
         scores = self.scorer.compute(snap)
+        scores["gates"] = evaluate_gates(snap, scores)
         state = self.states.update(scores, snap)
         text = interpret(self.symbol, snap, scores, state, self.states.reason)
         with self._lock:
@@ -542,6 +544,7 @@ class MarketSession:
                 "cascade_long": 0,
                 "cascade_short": 0,
                 "squeeze": {},
+                "gates": {"trade_status": "WAIT"},
             }
             feat = self._features()
             fp = self.foot.levels(self.timeframe, max_levels=int(get("footprint.max_levels", 40)))
@@ -559,6 +562,8 @@ class MarketSession:
                 "scores": scores,
                 "state": self.states.state,
                 "state_reason": self.states.reason,
+                "trade_status": (scores.get("gates") or {}).get("trade_status", "WAIT"),
+                "gates": scores.get("gates") or {},
                 "state_history": list(self.states.history[-40:]),
                 "score_hist": list(self.score_hist[-400:]),
                 "klines": {

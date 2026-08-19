@@ -42,7 +42,25 @@ def test_does_not_flip_every_tick_inside_dwell():
 
 
 def test_cascade_can_interrupt():
+    from src.gates import evaluate
+
     sm = StateMachine()
     sm.update(_scores(ls=85), {})
-    st = sm.update(_scores(ls=85, cl=90), {})
+    scores = _scores(ls=85, cl=90)
+    snap = {
+        "liq_15m": {"long_notional": 200000, "short_notional": 0},
+        "liq_5m": {"long_notional": 200000, "short_notional": 0},
+        "structure": {},
+        "oi_chg_15m_pct": -1.0,
+        "price_chg_15m_pct": -1.0,
+        "cvd_chg_5m": -10,
+    }
+    scores["gates"] = evaluate(snap, scores)
+    st = sm.update(scores, snap)
     assert st == "LONG LIQUIDATION CASCADE"
+
+
+def test_high_cascade_score_without_liq_is_not_cascade_state():
+    sm = StateMachine()
+    st = sm.update(_scores(ls=85, cl=90), {"liq_15m": {"long_notional": 0, "short_notional": 0}, "structure": {}})
+    assert st != "LONG LIQUIDATION CASCADE"

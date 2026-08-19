@@ -85,6 +85,12 @@ cascade:
   enter: 70
   exit: 50
 
+# Gating: confirmation is structure+flow, not the 0-100 confirm score.
+gates:
+  setup_watch: 70
+  forced_flow_notional: 50000
+  cascade_min_observed_notional: 100000
+
 squeeze:
   oi_drop_pct: 0.08
   price_move_pct: 0.08

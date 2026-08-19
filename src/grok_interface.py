@@ -28,11 +28,15 @@ re-score, do not place trades, do not claim certainty.
 - Do not rename states (e.g. do not say "bull trap" if STATE is POTENTIAL LONG TRAP).
 - Do not upgrade POTENTIAL LONG TRAP to a cascade unless CASCADE_LONG already meets the cascade rule.
 - Setup vs confirmation are separate. High setup + low confirm = vulnerable, NOT confirmed.
+- Confirm SCORE never confirms a trap. Confirmed long trap = (failed_breakout OR lost_support) AND (neg CVD follow OR OI unwind OR observed long liq).
+- Confirmed short trap = (failed_breakdown OR lost_resistance) AND (pos CVD follow OR OI unwind OR observed short liq).
+- Cascade STATE requires observed liquidation notional above gates.cascade_min_observed_notional. Intensity is price/OI/CVD only.
+- Funding percentile and account LS ratio are CROWDING PROXIES, not long/short OI.
 
 ## Allowed STATE values (exact strings)
 - NEUTRAL
-- LONG ACCUMULATION / CROWDING
-- SHORT ACCUMULATION / CROWDING
+- LONG-SIDE CROWDING ESTIMATE
+- SHORT-SIDE CROWDING ESTIMATE
 - POTENTIAL LONG TRAP
 - POTENTIAL SHORT TRAP
 - BUY ABSORPTION
