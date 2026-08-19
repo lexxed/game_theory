@@ -1,4 +1,19 @@
-"""Hysteresis state machine. Does not flip on a single tick."""
+"""Hysteresis state machine. Does not flip on a single tick.
+
+Architecture (do not invert):
+    scoring.py  -> raw evidence / intensity (including squeeze flags, cascade_long)
+    gates.py    -> authoritative booleans (long_squeeze, short_squeeze, long_cascade, ...)
+    this module -> STATE, by reading gates only for trade-event labels
+
+Priority (highest wins among states whose GATE is already true):
+    CASCADE (100) > SQUEEZE (90) > FORCED FLOW (80) > CASCADE EXHAUSTION (70)
+    > TRAP CONFIRM / POTENTIAL TRAP (60) > FAILED BO/BD (50) > BREAKOUT/DOWN (45)
+    > ABSORPTION (40) > SETUP (via potential trap enter) > CROWDING (20) > NEUTRAL (0)
+
+Priority never creates a cascade/squeeze/forced-flow whose gate is false.
+Cascade intensity (cascade_long / cascade_short) is diagnostic; it is used only as
+EXIT hysteresis into CASCADE EXHAUSTION after a real cascade, never as entry.
+"""
 
 from __future__ import annotations
 
@@ -80,39 +95,37 @@ class StateMachine:
         crowd_e = float(cfg.get("crowding_enter", 60))
         cas_x = float(get("cascade.exit", 50))
 
+        # Authoritative booleans live in gates.py. If the caller omitted them,
+        # compute once here — do not re-derive squeeze/cascade from raw scores.
         gates = scores.get("gates") or evaluate_gates(snap, scores)
         ls = scores["long_setup"]["total"]
         ss = scores["short_setup"]["total"]
-        cl = scores["cascade_long"]
-        cs = scores["cascade_short"]
-        sq = scores.get("squeeze") or {}
+        cl = float(scores.get("cascade_long") or 0.0)
+        cs = float(scores.get("cascade_short") or 0.0)
         ab = snap.get("absorption") or {}
         st = snap.get("structure") or {}
 
-        # Stronger states need stronger evidence. Intensity ≠ cascade.
+        # CASCADE entry: gate only. Intensity is never sufficient.
         if gates.get("long_cascade"):
             return "LONG LIQUIDATION CASCADE", (gates.get("explanation_text") or "long cascade gate")
         if gates.get("short_cascade"):
             return "SHORT LIQUIDATION CASCADE", (gates.get("explanation_text") or "short cascade gate")
 
-        if self.state == "LONG LIQUIDATION CASCADE" and gates.get("long_cascade"):
-            return self.state, "cascade still active"
-        if self.state == "SHORT LIQUIDATION CASCADE" and gates.get("short_cascade"):
-            return self.state, "cascade still active"
+        # Leave cascade via intensity EXIT only (hysteresis). Gate already false here.
         if self.state in ("LONG LIQUIDATION CASCADE", "SHORT LIQUIDATION CASCADE"):
             if cl < cas_x and cs < cas_x:
                 return "CASCADE EXHAUSTION", "cascade intensity fell through exit threshold"
 
-        # Canonical: SHORT SQUEEZE = shorts forced out (bullish). Requires forced-flow.
-        if gates.get("short_squeeze") or (sq.get("short_squeeze") and gates.get("short_forced_flow")):
-            return "SHORT SQUEEZE", sq.get("reason") or (gates.get("explanation_text") or "shorts forced out")
-        if gates.get("long_squeeze") or (sq.get("long_squeeze") and gates.get("long_forced_flow")):
-            return "LONG SQUEEZE", sq.get("reason") or (gates.get("explanation_text") or "longs forced out")
+        # SQUEEZE / FORCED FLOW: gates only. Raw scores["squeeze"] is evidence, not STATE.
+        if gates.get("short_squeeze"):
+            return "SHORT SQUEEZE", gates.get("trade_status_reason") or "short squeeze gate"
+        if gates.get("long_squeeze"):
+            return "LONG SQUEEZE", gates.get("trade_status_reason") or "long squeeze gate"
 
         if gates.get("short_forced_flow"):
-            return "SHORT FORCED FLOW", gates.get("trade_status_reason") or "meaningful short liq + price up + CVD up + OI down"
+            return "SHORT FORCED FLOW", gates.get("trade_status_reason") or "short forced-flow gate"
         if gates.get("long_forced_flow"):
-            return "LONG FORCED FLOW", gates.get("trade_status_reason") or "meaningful long liq + price down + CVD down + OI down"
+            return "LONG FORCED FLOW", gates.get("trade_status_reason") or "long forced-flow gate"
 
         # Confirm score is NOT used as a trap-confirmed signal.
         if gates.get("long_trap_confirmation") and ls >= setup_x:
@@ -157,6 +170,7 @@ class StateMachine:
 
 
 def _priority(state: str) -> int:
+    """Rank among candidates. Does not authorize a state whose gate is false."""
     order = {
         "LONG LIQUIDATION CASCADE": 100,
         "SHORT LIQUIDATION CASCADE": 100,
