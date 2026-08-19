@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.funding import FundingTracker
 from src.liquidations import LiquidationTracker
 from src.oi import OpenInterestTracker
+from src.trades import TradeTape
 
 
 def test_oi_change_windows():
@@ -47,3 +48,41 @@ def test_liquidation_side_mapping():
     st = liq.stats(now_ms() + 1_000)
     assert st["long_n"] == 1
     assert st["short_n"] == 1
+
+
+def test_taker_ratio_all_buy_is_plus_one():
+    t = TradeTape()
+    for i in range(5):
+        t._push(1000 + i, px=100.0, qty=1.0, is_buyer_maker=False)  # buy aggressor
+    out = t.taker_ratio(60_000)
+    assert abs(out["ratio"] - 1.0) < 1e-6
+    assert out["buy_vol"] == 5.0
+    assert out["sell_vol"] == 0.0
+
+
+def test_taker_ratio_all_sell_is_minus_one():
+    t = TradeTape()
+    for i in range(5):
+        t._push(1000 + i, px=100.0, qty=2.0, is_buyer_maker=True)  # sell aggressor
+    out = t.taker_ratio(60_000)
+    assert abs(out["ratio"] - (-1.0)) < 1e-6
+    assert out["sell_vol"] == 10.0
+
+
+def test_taker_ratio_respects_lookback_window():
+    t = TradeTape()
+    # old sells outside the window, recent buys inside it
+    t._push(0, px=100.0, qty=100.0, is_buyer_maker=True)
+    t._push(120_000, px=100.0, qty=5.0, is_buyer_maker=False)
+    t._push(121_000, px=100.0, qty=5.0, is_buyer_maker=False)
+    out = t.taker_ratio(10_000)  # only last 10s -> just the two recent buys
+    assert out["sell_vol"] == 0.0
+    assert out["buy_vol"] == 10.0
+    assert abs(out["ratio"] - 1.0) < 1e-6
+
+
+def test_taker_ratio_no_trades_is_neutral():
+    t = TradeTape()
+    out = t.taker_ratio(60_000)
+    assert out["ratio"] == 0.0
+    assert out["n"] == 0

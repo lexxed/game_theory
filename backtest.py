@@ -79,6 +79,38 @@ def forward_stats(scores: pd.DataFrame, candles: pd.DataFrame, col: str, thresh:
     return pd.DataFrame(rows)
 
 
+def run_report(scores: pd.DataFrame, candles: pd.DataFrame, col: str, thresh: float):
+    """Return (events, summary). Empty frames if nothing to measure."""
+    ev = forward_stats(scores, candles, col, thresh)
+    return ev, summarize(ev)
+
+
+def frames_from_session(engine) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Use the live dashboard session so we do not open a second DuckDB lock."""
+    hist = pd.DataFrame(list(getattr(engine, "score_hist", []) or []))
+    bars = engine.structure.last_n(getattr(engine, "timeframe", "15m"), 500)
+    candles = pd.DataFrame(bars) if bars else pd.DataFrame()
+    store = getattr(engine, "storage", None)
+    if store is not None and hasattr(store, "query"):
+        try:
+            db = store.query(
+                "SELECT * FROM scores WHERE symbol = ? ORDER BY ts",
+                [engine.symbol],
+            )
+            if db is not None and not db.empty:
+                if hist.empty:
+                    hist = db
+                else:
+                    hist = (
+                        pd.concat([db, hist], ignore_index=True)
+                        .drop_duplicates(subset=["ts"], keep="last")
+                        .sort_values("ts")
+                    )
+        except Exception:
+            pass
+    return hist, candles
+
+
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -95,7 +127,8 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
                 "n": int(s.shape[0]),
                 "avg_return": float(s.mean()),
                 "median_return": float(s.median()),
-                "win_rate": float((s > 0).mean()),
+                "pct_price_down": float((s < 0).mean()),
+                "pct_price_up": float((s > 0).mean()),
                 "avg_mfe": float(df[f"mfe_{name}"].mean()) if f"mfe_{name}" in df else None,
                 "avg_mae": float(df[f"mae_{name}"].mean()) if f"mae_{name}" in df else None,
             }
@@ -107,7 +140,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Forward-return report after high scores. Not a performance claim.")
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--score", default="long_setup", choices=["long_setup", "short_setup", "long_confirm", "short_confirm"])
-    p.add_argument("--min", dest="thresh", type=float, default=80.0)
+    p.add_argument("--min", dest="thresh", type=float, default=60.0)
     args = p.parse_args()
     scores, candles = load_joined(args.symbol)
     print(f"Loaded {len(scores)} score rows, {len(candles)} 15m candles for {args.symbol}")

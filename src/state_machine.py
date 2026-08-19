@@ -15,12 +15,16 @@ STATES = [
     "POTENTIAL SHORT TRAP",
     "BUY ABSORPTION",
     "SELL ABSORPTION",
+    "BREAKOUT",
+    "BREAKDOWN",
     "FAILED BREAKOUT",
     "FAILED BREAKDOWN",
+    "LONG FORCED FLOW",
+    "SHORT FORCED FLOW",
+    "LONG SQUEEZE",
+    "SHORT SQUEEZE",
     "LONG LIQUIDATION CASCADE",
     "SHORT LIQUIDATION CASCADE",
-    "SHORT SQUEEZE",
-    "LONG SQUEEZE",
     "CASCADE EXHAUSTION",
 ]
 
@@ -51,8 +55,8 @@ class StateMachine:
 
         # hysteresis: leaving a state requires being below exit or dwell elapsed
         if now - self.since < dwell and self.state != "NEUTRAL":
-            # allow upgrade to a higher-priority cascade/squeeze immediately
-            if _priority(candidate) >= 80 and _priority(candidate) > _priority(self.state):
+            # allow upgrade to a stronger event (forced-flow / squeeze / cascade)
+            if _priority(candidate) >= 70 and _priority(candidate) > _priority(self.state):
                 pass
             else:
                 return self.state
@@ -85,11 +89,11 @@ class StateMachine:
         ab = snap.get("absorption") or {}
         st = snap.get("structure") or {}
 
-        # Cascades require observed liquidation (gate), not intensity alone.
+        # Stronger states need stronger evidence. Intensity ≠ cascade.
         if gates.get("long_cascade"):
-            return "LONG LIQUIDATION CASCADE", "observed long liq above threshold + cascade intensity"
+            return "LONG LIQUIDATION CASCADE", (gates.get("explanation_text") or "long cascade gate")
         if gates.get("short_cascade"):
-            return "SHORT LIQUIDATION CASCADE", "observed short liq above threshold + cascade intensity"
+            return "SHORT LIQUIDATION CASCADE", (gates.get("explanation_text") or "short cascade gate")
 
         if self.state == "LONG LIQUIDATION CASCADE" and gates.get("long_cascade"):
             return self.state, "cascade still active"
@@ -99,10 +103,16 @@ class StateMachine:
             if cl < cas_x and cs < cas_x:
                 return "CASCADE EXHAUSTION", "cascade intensity fell through exit threshold"
 
-        if sq.get("long_squeeze"):
-            return "LONG SQUEEZE", sq.get("reason", "short covering / short liqs")
-        if sq.get("short_squeeze"):
-            return "SHORT SQUEEZE", sq.get("reason", "long covering / long liqs")
+        # Canonical: SHORT SQUEEZE = shorts forced out (bullish). Requires forced-flow.
+        if gates.get("short_squeeze") or (sq.get("short_squeeze") and gates.get("short_forced_flow")):
+            return "SHORT SQUEEZE", sq.get("reason") or (gates.get("explanation_text") or "shorts forced out")
+        if gates.get("long_squeeze") or (sq.get("long_squeeze") and gates.get("long_forced_flow")):
+            return "LONG SQUEEZE", sq.get("reason") or (gates.get("explanation_text") or "longs forced out")
+
+        if gates.get("short_forced_flow"):
+            return "SHORT FORCED FLOW", gates.get("trade_status_reason") or "meaningful short liq + price up + CVD up + OI down"
+        if gates.get("long_forced_flow"):
+            return "LONG FORCED FLOW", gates.get("trade_status_reason") or "meaningful long liq + price down + CVD down + OI down"
 
         # Confirm score is NOT used as a trap-confirmed signal.
         if gates.get("long_trap_confirmation") and ls >= setup_x:
@@ -114,6 +124,17 @@ class StateMachine:
             return "FAILED BREAKOUT", "range high taken out then rejected"
         if st.get("failed_breakdown") and ss >= setup_x:
             return "FAILED BREAKDOWN", "range low taken out then rejected"
+
+        # Clean breakout/breakdown: a discrete close-over-close crossing of the prior
+        # range level (see price_structure.analyze), confirmed by OI expanding and CVD
+        # following in the same direction. Without that confirmation this is just price
+        # poking outside a range on thin participation — not scored as a breakout state.
+        oi15 = float(snap.get("oi_chg_15m_pct") or 0.0)
+        cvd5 = float(snap.get("cvd_chg_5m") or 0.0)
+        if st.get("breakout") and oi15 > 0 and cvd5 > 0:
+            return "BREAKOUT", f"close crossed prior range high, OI {oi15:+.3f}% CVD5 {cvd5:+.4g} confirming"
+        if st.get("breakdown") and oi15 > 0 and cvd5 < 0:
+            return "BREAKDOWN", f"close crossed prior range low, OI {oi15:+.3f}% CVD5 {cvd5:+.4g} confirming"
 
         if ab.get("buy_absorption") and (ab.get("strength") or 0) * 100 >= abs_e:
             return "BUY ABSORPTION", ab.get("reason", "buy absorption")
@@ -139,13 +160,17 @@ def _priority(state: str) -> int:
     order = {
         "LONG LIQUIDATION CASCADE": 100,
         "SHORT LIQUIDATION CASCADE": 100,
-        "LONG SQUEEZE": 80,
-        "SHORT SQUEEZE": 80,
+        "LONG SQUEEZE": 90,
+        "SHORT SQUEEZE": 90,
+        "LONG FORCED FLOW": 80,
+        "SHORT FORCED FLOW": 80,
         "CASCADE EXHAUSTION": 70,
         "POTENTIAL LONG TRAP": 60,
         "POTENTIAL SHORT TRAP": 60,
         "FAILED BREAKOUT": 50,
         "FAILED BREAKDOWN": 50,
+        "BREAKOUT": 45,
+        "BREAKDOWN": 45,
         "BUY ABSORPTION": 40,
         "SELL ABSORPTION": 40,
         "LONG-SIDE CROWDING ESTIMATE": 20,

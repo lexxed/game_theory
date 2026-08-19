@@ -25,9 +25,19 @@ class WebsocketManager:
     Runs an asyncio loop in a daemon thread. Never raises into the caller.
     """
 
-    def __init__(self, on_message: MessageHandler, on_status: Callable[[str, str], None] | None = None):
+    def __init__(
+        self,
+        on_message: MessageHandler,
+        on_status: Callable[[str, str], None] | None = None,
+        base_url: str | None = None,
+        status_key: str = "ws",
+        thread_name: str = "gt-ws",
+    ):
         self.on_message = on_message
         self.on_status = on_status or (lambda _s, _m: None)
+        self.base_url = base_url
+        self.status_key = status_key
+        self.thread_name = thread_name
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = threading.Event()
@@ -42,7 +52,7 @@ class WebsocketManager:
         self.stop()
         self._stop.clear()
         self._streams = list(streams)
-        self._thread = threading.Thread(target=self._thread_main, name="gt-ws", daemon=True)
+        self._thread = threading.Thread(target=self._thread_main, name=self.thread_name, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -78,12 +88,12 @@ class WebsocketManager:
 
     async def _run(self) -> None:
         backoff = 1.0
-        base = get("binance.ws_combined", "wss://fstream.binance.com/market/stream")
+        base = self.base_url or get("binance.ws_combined", "wss://fstream.binance.com/market/stream")
         while not self._stop.is_set():
             streams = "/".join(self._streams)
             self.url = f"{base}?streams={streams}"
             try:
-                self.on_status("ws", "connecting")
+                self.on_status(self.status_key, "connecting")
                 async with websockets.connect(
                     self.url,
                     ping_interval=15,
@@ -95,13 +105,13 @@ class WebsocketManager:
                     self.connected = True
                     self.last_error = ""
                     backoff = 1.0
-                    self.on_status("ws", "live")
+                    self.on_status(self.status_key, "live")
                     await self._read_loop(ws)
             except Exception as exc:
                 self.connected = False
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 self.reconnects += 1
-                self.on_status("ws", f"reconnect {self.last_error}")
+                self.on_status(self.status_key, f"reconnect {self.last_error}")
                 log.warning("ws disconnect: %s", self.last_error)
             if self._stop.is_set():
                 break
@@ -109,7 +119,7 @@ class WebsocketManager:
             backoff = min(backoff * 1.7, 30.0)
 
         self.connected = False
-        self.on_status("ws", "stopped")
+        self.on_status(self.status_key, "stopped")
 
     async def _read_loop(self, ws) -> None:
         started = time.time()

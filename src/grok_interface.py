@@ -27,10 +27,17 @@ re-score, do not place trades, do not claim certainty.
 - STATE is already assigned by the state machine. Repeat it verbatim.
 - Do not rename states (e.g. do not say "bull trap" if STATE is POTENTIAL LONG TRAP).
 - Do not upgrade POTENTIAL LONG TRAP to a cascade unless CASCADE_LONG already meets the cascade rule.
-- Setup vs confirmation are separate. High setup + low confirm = vulnerable, NOT confirmed.
-- Confirm SCORE never confirms a trap. Confirmed long trap = (failed_breakout OR lost_support) AND (neg CVD follow OR OI unwind OR observed long liq).
-- Confirmed short trap = (failed_breakdown OR lost_resistance) AND (pos CVD follow OR OI unwind OR observed short liq).
-- Cascade STATE requires observed liquidation notional above gates.cascade_min_observed_notional. Intensity is price/OI/CVD only.
+- Setup score = VULNERABILITY only. High setup is WATCH, not a confirmed trap.
+- Confirm SCORE (0-100) is DIAGNOSTIC ONLY. Never say a trap is confirmed or denied because confirm is below/above 65.
+- LONG_TRAP_CONFIRMATION_GATE is the only confirmation boolean.
+  Long confirmed = (failed_breakout OR lost_support) AND (neg CVD follow OR OI unwind into decline OR meaningful long-liq flow with price down).
+  Short confirmed = (failed_breakdown OR lost_resistance) AND (pos CVD follow OR OI unwind into rally OR meaningful short-liq flow with price up).
+  A tiny liquidation print (liq>0) does NOT confirm a trap.
+- TRADE_STATUS is already computed. Repeat it verbatim. Do not invent a different status.
+- liquidation_event ≠ forced_flow ≠ trap ≠ squeeze ≠ cascade.
+- SHORT FORCED FLOW requires meaningful short liq AND rising price AND rising CVD AND declining OI. A short print while price/CVD are falling is EVENT ONLY.
+- LONG FORCED FLOW requires meaningful long liq AND falling price AND falling CVD AND declining OI.
+- Cascade STATE requires the cascade GATE (intensity + meaningful same-side liq + direction). Intensity (CASCADE_LONG/SHORT) is price/OI/CVD only and is NOT a cascade by itself.
 - Funding percentile and account LS ratio are CROWDING PROXIES, not long/short OI.
 
 ## Allowed STATE values (exact strings)
@@ -43,10 +50,12 @@ re-score, do not place trades, do not claim certainty.
 - SELL ABSORPTION
 - FAILED BREAKOUT
 - FAILED BREAKDOWN
+- LONG FORCED FLOW
+- SHORT FORCED FLOW
+- LONG SQUEEZE
+- SHORT SQUEEZE
 - LONG LIQUIDATION CASCADE
 - SHORT LIQUIDATION CASCADE
-- SHORT SQUEEZE
-- LONG SQUEEZE
 - CASCADE EXHAUSTION
 
 ## Metric definitions (this engine)
@@ -67,27 +76,33 @@ re-score, do not place trades, do not claim certainty.
 - Liquidations: OBSERVED !forceOrder@arr only. SELL force-order = longs liquidated. BUY force-order = shorts liquidated. Sampled (~1 event/symbol/sec). Not a hidden liquidation map.
 - Long trap SETUP: estimated long crowding + OI expanding into a rally/stall + high funding + bearish CVD div + buy absorption + observed long-liq risk + near highs / failed breakout.
 - Short trap SETUP: mirror (low/negative funding, OI expanding into decline, bullish CVD div, sell absorption, short-liq risk, near lows / failed breakdown).
-- Long trap CONFIRMATION: lost support + OI shrinking with price down + observed long liqs + CVD following down + downside acceleration. Requires adverse flow, not just high funding.
-- Short trap CONFIRMATION: broken resistance + OI shrinking with price up + observed short liqs + CVD following up + upside acceleration.
-- LONG SQUEEZE (engine name) = shorts squeezed / short covering candidate: price up, OI down, CVD up, observed short liqs. Could also be voluntary covering.
-- SHORT SQUEEZE (engine name) = longs squeezed / long covering candidate: price down, OI down, CVD down, observed long liqs.
-- LONG LIQUIDATION CASCADE: price down + OI shrinking + observed long-liq spike + sell/CVD down. Intensity 0-100; enter >= cascade.enter (default 70).
+- Long trap CONFIRMATION GATE: (failed_breakout OR lost_support) AND (neg CVD follow OR OI unwind into decline OR meaningful long-liq with price down). Ignore confirm score for this.
+- Short trap CONFIRMATION GATE: (failed_breakdown OR lost_resistance) AND (pos CVD follow OR OI unwind into rally OR meaningful short-liq with price up). Ignore confirm score for this.
+- SHORT SQUEEZE = shorts forced out: price up, OI down, CVD up, meaningful short liqs. Could also be voluntary covering.
+- LONG SQUEEZE = longs forced out: price down, OI down, CVD down, meaningful long liqs. Could also be voluntary covering.
+- Do NOT invert squeeze names. SHORT SQUEEZE is bullish for price; LONG SQUEEZE is bearish.
+- LONG LIQUIDATION CASCADE: intensity from price down + OI shrinking + CVD down, AND meaningful observed long-liq + direction. Intensity alone is not a cascade.
 - SHORT LIQUIDATION CASCADE: mirror on the upside.
-- Setup enter default 70. Confirm enter default 65. Absorption enter uses absorption.strength*100 >= 60.
+- SHORT_LIQ_EVENT true with SHORT_FORCED_FLOW false is a valid state (print only).
+- Setup watch default 70. Absorption enter uses absorption.strength*100 >= 60.
 - A high Long Trap Setup does NOT mean price must fall. A high Short Trap Setup does NOT mean price must rise.
+- Do not mention "confirm enter 65". That threshold does not confirm traps.
 
 ## Forbidden
 - Do not say the exchange is manipulating price.
 - Do not invent liquidation clusters or "smart money".
-- Do not contradict the engine STATE unless you are pointing out that CONFIRMATION is below threshold (then say "STATE is X but confirmation is only Y — treat as setup, not forced flow").
+- Do not contradict ENGINE_STATE or TRADE_STATUS.
 - If evidence is thin, say UNCLEAR.
 
 ## Output format (no other sections)
 ENGINE_STATE: <verbatim STATE>
-SETUP_VS_CONFIRM: long setup/confirm = A/B ; short setup/confirm = C/D
+TRADE_STATUS: <verbatim TRADE_STATUS>
+SETUP_VS_CONFIRM: long setup/confirm-score = A/B ; short setup/confirm-score = C/D  (scores only; B and D are NOT gates)
+CONFIRMATION_GATE: long=<true/false> short=<true/false>
 VULNERABLE_SIDE: LONGS | SHORTS | UNCLEAR
 ABSORPTION: NONE | BUY ABSORPTION | SELL ABSORPTION | UNCLEAR  (use engine flags, not vibes)
-FORCED_FLOW: NONE | OBSERVED LONG LIQS | OBSERVED SHORT LIQS | OI UNWIND | CASCADE | UNCLEAR
+LIQ_EVENT: NONE | LONG | SHORT | BOTH
+FORCED_FLOW: NONE | LONG FORCED FLOW | SHORT FORCED FLOW | CASCADE | UNCLEAR
 TRAP_STATUS: NO TRAP | LONG SETUP ONLY | LONG SETUP+CONFIRM | SHORT SETUP ONLY | SHORT SETUP+CONFIRM
 INVALIDATION: <what would break THIS state's reading, in the engine's terms>
 COMMENT: <6-10 sentences applying the rules to the snapshot. Label any extra inference as INTERPRETATION.>
@@ -228,12 +243,29 @@ def compact_snapshot(
         },
         "liq_5m_observed": liq5,
         "liq_15m_observed": liq15,
-        "LONG_TRAP_SETUP": scores["long_setup"]["total"],
-        "LONG_TRAP_CONFIRMATION": scores["long_confirm"]["total"],
-        "SHORT_TRAP_SETUP": scores["short_setup"]["total"],
-        "SHORT_TRAP_CONFIRMATION": scores["short_confirm"]["total"],
-        "CASCADE_LONG": scores.get("cascade_long"),
-        "CASCADE_SHORT": scores.get("cascade_short"),
+        "TRADE_STATUS": (scores.get("gates") or {}).get("trade_status", "WAIT"),
+        "LONG_VULNERABILITY": (scores.get("gates") or {}).get("long_vulnerability", scores["long_setup"]["total"]),
+        "SHORT_VULNERABILITY": (scores.get("gates") or {}).get("short_vulnerability", scores["short_setup"]["total"]),
+        "LONG_TRAP_SETUP_SCORE": scores["long_setup"]["total"],
+        "LONG_TRAP_CONFIRM_SCORE_DIAGNOSTIC_ONLY": scores["long_confirm"]["total"],
+        "LONG_TRAP_CONFIRMATION_GATE": (scores.get("gates") or {}).get("long_trap_confirmation", False),
+        "SHORT_TRAP_SETUP_SCORE": scores["short_setup"]["total"],
+        "SHORT_TRAP_CONFIRM_SCORE_DIAGNOSTIC_ONLY": scores["short_confirm"]["total"],
+        "SHORT_TRAP_CONFIRMATION_GATE": (scores.get("gates") or {}).get("short_trap_confirmation", False),
+        "LONG_LIQ_EVENT": (scores.get("gates") or {}).get("long_liq_event", False),
+        "SHORT_LIQ_EVENT": (scores.get("gates") or {}).get("short_liq_event", False),
+        "LONG_LIQ_LEVEL": (scores.get("gates") or {}).get("long_liq_level", "none"),
+        "SHORT_LIQ_LEVEL": (scores.get("gates") or {}).get("short_liq_level", "none"),
+        "LONG_FORCED_FLOW": (scores.get("gates") or {}).get("long_forced_flow", False),
+        "SHORT_FORCED_FLOW": (scores.get("gates") or {}).get("short_forced_flow", False),
+        "LONG_SQUEEZE": (scores.get("gates") or {}).get("long_squeeze", False),
+        "SHORT_SQUEEZE": (scores.get("gates") or {}).get("short_squeeze", False),
+        "CASCADE_LONG_INTENSITY": scores.get("cascade_long"),
+        "CASCADE_SHORT_INTENSITY": scores.get("cascade_short"),
+        "LONG_CASCADE_GATE": (scores.get("gates") or {}).get("long_cascade", False),
+        "SHORT_CASCADE_GATE": (scores.get("gates") or {}).get("short_cascade", False),
+        "TRADE_STATUS_REASON": (scores.get("gates") or {}).get("trade_status_reason", ""),
+        "EXPLANATION": (scores.get("gates") or {}).get("explanation_text", ""),
         "SQUEEZE": scores.get("squeeze"),
         "long_setup_components": _components(scores.get("long_setup") or {}),
         "long_confirm_components": _components(scores.get("long_confirm") or {}),

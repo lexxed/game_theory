@@ -1,0 +1,236 @@
+diff --git a/config.yaml b/config.yaml
+index de7785d..7cb2ebd 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -107,19 +107,20 @@ state_machine:
+   crowding_enter: 60
+ 
+ # Setup scores (must sum to 100)
+-# NOTE: existing 7 weights were proportionally trimmed ~10% (rounded) to make
+-# room for the new book_imbalance component below. Rebalance further to taste;
+-# the code does not require this to sum to exactly 100, but the dashboard's
+-# score display assumes a 0-100 scale so we keep it there by convention.
++# NOTE: weights have been trimmed twice (proportionally, rounded) to make
++# room first for book_imbalance, then for taker_flow, below. Rebalance
++# further to taste — the code doesn't require this to sum to exactly 100,
++# but the dashboard's score display assumes a 0-100 scale by convention.
+ weights_setup:
+-  crowding: 13
+-  oi_behavior: 13
+-  funding: 9
+-  cvd_divergence: 18
+-  absorption: 18
+-  liquidation_risk: 14
++  crowding: 11
++  oi_behavior: 12
++  funding: 8
++  cvd_divergence: 16
++  absorption: 16
++  liquidation_risk: 13
+   price_structure: 5
+-  book_imbalance: 10
++  book_imbalance: 9
++  taker_flow: 10
+ 
+ # Confirmation scores (must sum to 100)
+ weights_confirm:
+diff --git a/src/market_data.py b/src/market_data.py
+index 0276c98..15299f9 100644
+--- a/src/market_data.py
++++ b/src/market_data.py
+@@ -412,6 +412,8 @@ class MarketSession:
+             float(get("orderbook.price_range_pct", 0.5)),
+             float(get("orderbook.thin_wall_ratio", 0.20)),
+         )
++        taker_1m = self.trades.taker_ratio(60_000, "1m")
++        taker_5m = self.trades.taker_ratio(5 * 60_000, "5m")
+         return {
+             "price": price,
+             "change_24h_pct": (self.ticker or {}).get("change_pct", 0.0),
+@@ -434,6 +436,8 @@ class MarketSession:
+             "liq_15m": self.liqs.stats(15 * 60_000),
+             "structure": structure,
+             "orderbook": ob_s,
++            "taker_ratio_1m": taker_1m,
++            "taker_ratio_5m": taker_5m,
+         }
+ 
+     def _flush(self) -> None:
+diff --git a/src/scoring.py b/src/scoring.py
+index b635480..29d3042 100644
+--- a/src/scoring.py
++++ b/src/scoring.py
+@@ -220,6 +220,37 @@ class ScoreEngine:
+             )
+         comps.append(_comp("book_imbalance", ratio, raw, w.get("book_imbalance", 10), reason))
+ 
++        # --- taker buy/sell flow ratio (relative one-sidedness, not cumulative like CVD) ---
++        t1 = s.get("taker_ratio_1m") or {}
++        t5 = s.get("taker_ratio_5m") or {}
++        r1 = float(t1.get("ratio") or 0.0)
++        r5 = float(t5.get("ratio") or 0.0)
++        if side == "long":
++            # Heavy one-sided BUY flow is the demand-side crowding signal: if
++            # nearly everyone aggressive lately has been buying, most of the
++            # willing buyers may already be in — vulnerable to a flush once
++            # that flow dries up. Weighted higher when the very recent (1m)
++            # ratio is running hotter than the 5m ratio (flow still
++            # intensifying, not already fading).
++            base = clip(r5) if r5 > 0 else 0.0
++            intensifying = r1 >= r5
++            raw = base * (1.0 if intensifying else 0.5)
++            reason = (
++                (t5.get("reason") or "taker flow not available")
++                + (f" | 1m ratio {r1:+.2f} {'confirms' if intensifying else 'is fading vs'} 5m"
++                   if base > 0 else "")
++            )
++        else:
++            base = clip(-r5) if r5 < 0 else 0.0
++            intensifying = r1 <= r5
++            raw = base * (1.0 if intensifying else 0.5)
++            reason = (
++                (t5.get("reason") or "taker flow not available")
++                + (f" | 1m ratio {r1:+.2f} {'confirms' if intensifying else 'is fading vs'} 5m"
++                   if base > 0 else "")
++            )
++        comps.append(_comp("taker_flow", r5, raw, w.get("taker_flow", 10), reason))
++
+         total = round(sum(c.points for c in comps), 2)
+         return ScoreCard(total, 100.0, comps)
+ 
+diff --git a/src/trades.py b/src/trades.py
+index db21354..7cfd11a 100644
+--- a/src/trades.py
++++ b/src/trades.py
+@@ -101,3 +101,29 @@ class TradeTape:
+             "first_px": first_px,
+             "last_px": last_px,
+         }
++
++    def taker_ratio(self, lookback_ms: int, label: str = "") -> dict:
++        """
++        Rolling taker buy/sell volume ratio over the last `lookback_ms`.
++        Complementary to CVD: CVD is a running cumulative total, this is a
++        bounded relative measure of how one-sided RECENT flow is, independent
++        of how large the absolute move has been. ratio in [-1, 1]:
++        +1 = all buy-side aggression, -1 = all sell-side aggression, 0 = even.
++        """
++        st = self.window_stats(lookback_ms)
++        buy, sell = st["buy_vol"], st["sell_vol"]
++        total = buy + sell
++        ratio = (buy - sell) / total if total > 0 else 0.0
++        lbl = label or f"{lookback_ms // 60_000}m"
++        return {
++            "ratio": round(ratio, 4),
++            "buy_vol": buy,
++            "sell_vol": sell,
++            "n": st["n"],
++            "reason": (
++                f"taker flow {lbl}: buy {buy:,.3f} vs sell {sell:,.3f} "
++                f"(ratio {ratio:+.2f}) — relative one-sidedness of recent aggressive "
++                f"volume, not a cumulative total like CVD, and not proof of net "
++                f"positioning by itself"
++            ),
++        }
+diff --git a/tests/test_scoring.py b/tests/test_scoring.py
+index 7ba6135..715af23 100644
+--- a/tests/test_scoring.py
++++ b/tests/test_scoring.py
+@@ -25,6 +25,8 @@ def _base(**kw):
+         "cvd_chg_15m": 0.0,
+         "orderbook": {"ready": False, "imbalance_ratio": 0.0, "bid_notional": 0.0, "ask_notional": 0.0,
+                       "thin_ask_wall_above": False, "thin_bid_wall_below": False, "reason": "not populated"},
++        "taker_ratio_1m": {"ratio": 0.0, "buy_vol": 0.0, "sell_vol": 0.0, "n": 0, "reason": "no trades"},
++        "taker_ratio_5m": {"ratio": 0.0, "buy_vol": 0.0, "sell_vol": 0.0, "n": 0, "reason": "no trades"},
+     }
+     s.update(kw)
+     return s
+@@ -34,7 +36,7 @@ def test_neutral_scores_low():
+     out = ScoreEngine().compute(_base())
+     assert 0 <= out["long_setup"]["total"] <= 40
+     assert out["long_setup"]["total"] + 1e-9 >= 0
+-    assert len(out["long_setup"]["components"]) == 8
++    assert len(out["long_setup"]["components"]) == 9
+ 
+ 
+ def test_long_trap_setup_rises_with_crowding_and_div():
+@@ -101,3 +103,25 @@ def test_book_imbalance_raises_long_setup_only_with_thin_wall():
+     # short setup should not be boosted by a positive (bid-heavy) imbalance
+     short_comp_thin = next(c for c in thin["short_setup"]["components"] if c["name"] == "book_imbalance")
+     assert short_comp_thin["points"] == 0
++
++
++def test_taker_flow_rewards_intensifying_one_sided_buying():
++    base_kw = dict(
++        taker_ratio_1m={"ratio": 0.8, "buy_vol": 90, "sell_vol": 10, "n": 50, "reason": "1m heavy buy"},
++        taker_ratio_5m={"ratio": 0.5, "buy_vol": 300, "sell_vol": 100, "n": 200, "reason": "5m heavy buy"},
++    )
++    intensifying = ScoreEngine().compute(_base(**base_kw))
++
++    fading_kw = dict(
++        taker_ratio_1m={"ratio": 0.1, "buy_vol": 55, "sell_vol": 45, "n": 50, "reason": "1m cooling"},
++        taker_ratio_5m={"ratio": 0.5, "buy_vol": 300, "sell_vol": 100, "n": 200, "reason": "5m heavy buy"},
++    )
++    fading = ScoreEngine().compute(_base(**fading_kw))
++
++    ic = next(c for c in intensifying["long_setup"]["components"] if c["name"] == "taker_flow")
++    fc = next(c for c in fading["long_setup"]["components"] if c["name"] == "taker_flow")
++    assert ic["points"] > fc["points"] > 0
++
++    # heavy BUY flow should not boost the short setup's taker_flow component
++    short_c = next(c for c in intensifying["short_setup"]["components"] if c["name"] == "taker_flow")
++    assert short_c["points"] == 0
+diff --git a/tests/test_trackers.py b/tests/test_trackers.py
+index 3692cd6..b4a5642 100644
+--- a/tests/test_trackers.py
++++ b/tests/test_trackers.py
+@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from src.funding import FundingTracker
+ from src.liquidations import LiquidationTracker
+ from src.oi import OpenInterestTracker
++from src.trades import TradeTape
+ 
+ 
+ def test_oi_change_windows():
+@@ -47,3 +48,41 @@ def test_liquidation_side_mapping():
+     st = liq.stats(now_ms() + 1_000)
+     assert st["long_n"] == 1
+     assert st["short_n"] == 1
++
++
++def test_taker_ratio_all_buy_is_plus_one():
++    t = TradeTape()
++    for i in range(5):
++        t._push(1000 + i, px=100.0, qty=1.0, is_buyer_maker=False)  # buy aggressor
++    out = t.taker_ratio(60_000)
++    assert abs(out["ratio"] - 1.0) < 1e-6
++    assert out["buy_vol"] == 5.0
++    assert out["sell_vol"] == 0.0
++
++
++def test_taker_ratio_all_sell_is_minus_one():
++    t = TradeTape()
++    for i in range(5):
++        t._push(1000 + i, px=100.0, qty=2.0, is_buyer_maker=True)  # sell aggressor
++    out = t.taker_ratio(60_000)
++    assert abs(out["ratio"] - (-1.0)) < 1e-6
++    assert out["sell_vol"] == 10.0
++
++
++def test_taker_ratio_respects_lookback_window():
++    t = TradeTape()
++    # old sells outside the window, recent buys inside it
++    t._push(0, px=100.0, qty=100.0, is_buyer_maker=True)
++    t._push(120_000, px=100.0, qty=5.0, is_buyer_maker=False)
++    t._push(121_000, px=100.0, qty=5.0, is_buyer_maker=False)
++    out = t.taker_ratio(10_000)  # only last 10s -> just the two recent buys
++    assert out["sell_vol"] == 0.0
++    assert out["buy_vol"] == 10.0
++    assert abs(out["ratio"] - 1.0) < 1e-6
++
++
++def test_taker_ratio_no_trades_is_neutral():
++    t = TradeTape()
++    out = t.taker_ratio(60_000)
++    assert out["ratio"] == 0.0
++    assert out["n"] == 0

@@ -140,6 +140,14 @@ class BinanceClient:
             for x in raw
         ]
 
+    def depth(self, symbol: str, limit: int = 20) -> dict:
+        d = self._get("/fapi/v1/depth", {"symbol": symbol.upper(), "limit": limit})
+        return {
+            "lastUpdateId": int(d.get("lastUpdateId") or 0),
+            "bids": d.get("bids") or [],
+            "asks": d.get("asks") or [],
+        }
+
     def open_interest(self, symbol: str) -> dict:
         d = self._get("/fapi/v1/openInterest", {"symbol": symbol.upper()})
         return {

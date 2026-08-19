@@ -53,7 +53,9 @@ def test_cascade_can_interrupt():
         "structure": {},
         "oi_chg_15m_pct": -1.0,
         "price_chg_15m_pct": -1.0,
+        "price_chg_5m_pct": -0.8,
         "cvd_chg_5m": -10,
+        "cvd_chg_15m": -10,
     }
     scores["gates"] = evaluate(snap, scores)
     st = sm.update(scores, snap)
@@ -64,3 +66,34 @@ def test_high_cascade_score_without_liq_is_not_cascade_state():
     sm = StateMachine()
     st = sm.update(_scores(ls=85, cl=90), {"liq_15m": {"long_notional": 0, "short_notional": 0}, "structure": {}})
     assert st != "LONG LIQUIDATION CASCADE"
+
+
+def test_breakout_requires_oi_and_cvd_confirmation():
+    sm = StateMachine()
+    snap_unconfirmed = {
+        "structure": {"breakout": True},
+        "oi_chg_15m_pct": -0.1,  # OI shrinking -> not confirmed
+        "cvd_chg_5m": 5.0,
+    }
+    st = sm.update(_scores(), snap_unconfirmed)
+    assert st != "BREAKOUT"
+
+    sm2 = StateMachine()
+    snap_confirmed = {
+        "structure": {"breakout": True},
+        "oi_chg_15m_pct": 0.5,
+        "cvd_chg_5m": 5.0,
+    }
+    st2 = sm2.update(_scores(), snap_confirmed)
+    assert st2 == "BREAKOUT"
+
+
+def test_breakdown_requires_oi_and_cvd_confirmation():
+    sm = StateMachine()
+    snap_confirmed = {
+        "structure": {"breakdown": True},
+        "oi_chg_15m_pct": 0.5,
+        "cvd_chg_5m": -5.0,
+    }
+    st = sm.update(_scores(), snap_confirmed)
+    assert st == "BREAKDOWN"

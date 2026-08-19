@@ -18,6 +18,7 @@ from src.game_theory import interpret
 from src.gates import evaluate as evaluate_gates
 from src.liquidations import LiquidationTracker
 from src.oi import OpenInterestTracker
+from src.orderbook import OrderBookTracker
 from src.price_structure import PriceStructure
 from src.scoring import ScoreEngine
 from src.state_machine import StateMachine
@@ -42,12 +43,20 @@ class MarketSession:
             keep_bars=int(get("buffers.footprint_bars", 48)),
         )
         self.oi = OpenInterestTracker(int(get("buffers.max_oi_rows", 4000)))
+        self.orderbook = OrderBookTracker()
         self.funding = FundingTracker(int(get("buffers.max_funding_rows", 2000)))
         self.liqs = LiquidationTracker(int(get("buffers.max_liquidations", 3000)))
         self.structure = PriceStructure()
         self.scorer = ScoreEngine()
         self.states = StateMachine()
         self.ws = WebsocketManager(self._on_ws, self._on_ws_status)
+        self.ws_book = WebsocketManager(
+            self._on_ws,
+            self._on_ws_status,
+            base_url=get("binance.ws_public_combined", "wss://fstream.binance.com/public/stream"),
+            status_key="orderbook",
+            thread_name="gt-ws-book",
+        )
 
         self.meta: dict[str, Any] = {}
         self.ticker: dict[str, Any] = {}
@@ -64,7 +73,7 @@ class MarketSession:
         self.score_hist: list[dict] = []
         self.status: dict[str, dict] = {
             k: {"state": "DOWN", "ts": 0, "detail": ""}
-            for k in ("ws", "price", "trades", "oi", "funding", "liquidation", "kline")
+            for k in ("ws", "price", "trades", "oi", "funding", "liquidation", "kline", "orderbook")
         }
         self.last_flush = 0.0
         self.last_error = ""
@@ -88,6 +97,7 @@ class MarketSession:
             log.exception("seed")
             raise
         self.ws.start(self._stream_list())
+        self.ws_book.start(self._depth_stream_list())
         self.running = True
         self._poll_thread = threading.Thread(target=self._poll_loop, name="gt-poll", daemon=True)
         self._score_thread = threading.Thread(target=self._score_loop, name="gt-score", daemon=True)
@@ -99,6 +109,10 @@ class MarketSession:
         self.running = False
         try:
             self.ws.stop()
+        except Exception:
+            pass
+        try:
+            self.ws_book.stop()
         except Exception:
             pass
         if self._poll_thread and self._poll_thread.is_alive():
@@ -157,6 +171,7 @@ class MarketSession:
         self.cvd.reset()
         self.foot.reset()
         self.oi.reset()
+        self.orderbook.reset()
         self.funding.reset()
         self.liqs.reset()
         self.structure.reset()
@@ -180,6 +195,11 @@ class MarketSession:
             f"{s}@ticker",
             "!forceOrder@arr",
         ]
+
+    def _depth_stream_list(self) -> list[str]:
+        s = self.symbol.lower()
+        levels = int(get("orderbook.depth_stream_levels", 20))
+        return [f"{s}@depth{levels}@100ms"]
 
     # ------------------------------------------------------------------
     def _seed(self) -> None:
@@ -239,18 +259,29 @@ class MarketSession:
         self._status("oi", "live")
         self._status("funding", "live")
         self._status("liquidation", "idle", "waiting for observed force-orders")
+        try:
+            levels = int(get("orderbook.depth_stream_levels", 20))
+            snap = self.client.depth(self.symbol, limit=levels)
+            self.orderbook.on_depth(snap)
+            if self.orderbook.bids and self.orderbook.asks:
+                self._status("orderbook", "live", "REST depth seed")
+        except Exception as exc:
+            log.warning("depth seed: %s", exc)
+            self._status("orderbook", "stale", str(exc))
 
     # ------------------------------------------------------------------
-    def _on_ws_status(self, _s: str, msg: str) -> None:
+    def _on_ws_status(self, key: str, msg: str) -> None:
         st = "live" if msg == "live" else ("connecting" if msg == "connecting" else "stale")
-        self._status("ws", st, msg)
-        if msg == "live":
-            self.liqs.socket_ok = True
-            if self.status["liquidation"]["state"] == "DOWN":
-                self._status("liquidation", "idle", "socket up, no event yet")
-        elif st == "stale":
-            self.liqs.socket_ok = False
-            self._status("liquidation", "stale", msg)
+        target = key if key in self.status else "ws"
+        self._status(target, st, msg)
+        if key == "ws":
+            if msg == "live":
+                self.liqs.socket_ok = True
+                if self.status["liquidation"]["state"] == "DOWN":
+                    self._status("liquidation", "idle", "socket up, no event yet")
+            elif st == "stale":
+                self.liqs.socket_ok = False
+                self._status("liquidation", "stale", msg)
 
     def _on_ws(self, stream: str, data: dict) -> None:
         ev = data.get("e")
@@ -297,6 +328,9 @@ class MarketSession:
                 rec = self.liqs.ingest_ws(data, self.symbol)
                 if rec:
                     self._status("liquidation", "live", f"{rec['liq_of']} @ {rec['price']}")
+            elif ev == "depthUpdate" or "@depth" in stream:
+                self.orderbook.on_depth(data)
+                self._status("orderbook", "live")
         except Exception:
             log.exception("ws handle %s", stream)
 
@@ -400,6 +434,12 @@ class MarketSession:
         )
         oi_s = self.oi.snapshot()
         fund_s = self.funding.snapshot()
+        ob_s = self.orderbook.imbalance(
+            float(get("orderbook.price_range_pct", 0.5)),
+            float(get("orderbook.thin_wall_ratio", 0.20)),
+        )
+        taker_1m = self.trades.taker_ratio(60_000, "1m")
+        taker_5m = self.trades.taker_ratio(5 * 60_000, "5m")
         return {
             "price": price,
             "change_24h_pct": (self.ticker or {}).get("change_pct", 0.0),
@@ -420,7 +460,12 @@ class MarketSession:
             "absorption": absorption,
             "liq_5m": self.liqs.stats(5 * 60_000),
             "liq_15m": self.liqs.stats(15 * 60_000),
+            "liq_baseline": self.liqs.baseline(15 * 60_000, 4 * 60 * 60_000),
+            "oi_value": float(oi_s.get("oi_value") or 0.0),
             "structure": structure,
+            "orderbook": ob_s,
+            "taker_ratio_1m": taker_1m,
+            "taker_ratio_5m": taker_5m,
         }
 
     def _flush(self) -> None:
@@ -543,7 +588,7 @@ class MarketSession:
                 "short_confirm": {"total": 0, "components": []},
                 "cascade_long": 0,
                 "cascade_short": 0,
-                "squeeze": {},
+                "squeeze": {"long_squeeze": False, "short_squeeze": False},
                 "gates": {"trade_status": "WAIT"},
             }
             feat = self._features()
@@ -583,8 +628,7 @@ class MarketSession:
                     )
                 },
                 "oi_hist": self.oi.points.last(300),
-                "funding_hist": self.funding.points.last(200),
-                "cvd_tf": self.cvd.series(self.timeframe),
+                "funding_hist": self.funding.points.last(200),                "cvd_tf": self.cvd.series(self.timeframe),
                 "liq_events": self.liqs.window(60 * 60_000),
                 "footprint": fp,
                 "footprint_stacks": stacks,

@@ -1,0 +1,423 @@
+diff --git a/config.yaml b/config.yaml
+index f82fc22..de7785d 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -38,6 +38,7 @@ stale_after_s:
+   oi: 20
+   funding: 20
+   kline: 90
++  orderbook: 8
+   # Liquidations are event-driven. No event != stale if the socket is up.
+   liquidation_socket: 15
+ 
+@@ -106,14 +107,19 @@ state_machine:
+   crowding_enter: 60
+ 
+ # Setup scores (must sum to 100)
++# NOTE: existing 7 weights were proportionally trimmed ~10% (rounded) to make
++# room for the new book_imbalance component below. Rebalance further to taste;
++# the code does not require this to sum to exactly 100, but the dashboard's
++# score display assumes a 0-100 scale so we keep it there by convention.
+ weights_setup:
+-  crowding: 15
+-  oi_behavior: 15
+-  funding: 10
+-  cvd_divergence: 20
+-  absorption: 20
+-  liquidation_risk: 15
++  crowding: 13
++  oi_behavior: 13
++  funding: 9
++  cvd_divergence: 18
++  absorption: 18
++  liquidation_risk: 14
+   price_structure: 5
++  book_imbalance: 10
+ 
+ # Confirmation scores (must sum to 100)
+ weights_confirm:
+@@ -130,6 +136,12 @@ scoring_refs:
+   liq_notional_ref: 250000.0    # USDT, 15m window, scale per symbol later
+   near_extreme_pct: 0.15
+ 
++orderbook:
++  depth_stream_levels: 20        # matches <symbol>@depth20@100ms
++  price_range_pct: 0.5           # band above/below best bid/ask to sum notional in
++  thin_wall_ratio: 0.20          # ask (or bid) notional below this fraction of the
++                                  # opposing side's notional in the same band = "thin wall"
++
+ grok:
+   enabled: true
+   exe: grok
+diff --git a/src/market_data.py b/src/market_data.py
+index cc83b6d..0276c98 100644
+--- a/src/market_data.py
++++ b/src/market_data.py
+@@ -18,6 +18,7 @@ from src.game_theory import interpret
+ from src.gates import evaluate as evaluate_gates
+ from src.liquidations import LiquidationTracker
+ from src.oi import OpenInterestTracker
++from src.orderbook import OrderBookTracker
+ from src.price_structure import PriceStructure
+ from src.scoring import ScoreEngine
+ from src.state_machine import StateMachine
+@@ -42,6 +43,7 @@ class MarketSession:
+             keep_bars=int(get("buffers.footprint_bars", 48)),
+         )
+         self.oi = OpenInterestTracker(int(get("buffers.max_oi_rows", 4000)))
++        self.orderbook = OrderBookTracker()
+         self.funding = FundingTracker(int(get("buffers.max_funding_rows", 2000)))
+         self.liqs = LiquidationTracker(int(get("buffers.max_liquidations", 3000)))
+         self.structure = PriceStructure()
+@@ -64,7 +66,7 @@ class MarketSession:
+         self.score_hist: list[dict] = []
+         self.status: dict[str, dict] = {
+             k: {"state": "DOWN", "ts": 0, "detail": ""}
+-            for k in ("ws", "price", "trades", "oi", "funding", "liquidation", "kline")
++            for k in ("ws", "price", "trades", "oi", "funding", "liquidation", "kline", "orderbook")
+         }
+         self.last_flush = 0.0
+         self.last_error = ""
+@@ -157,6 +159,7 @@ class MarketSession:
+         self.cvd.reset()
+         self.foot.reset()
+         self.oi.reset()
++        self.orderbook.reset()
+         self.funding.reset()
+         self.liqs.reset()
+         self.structure.reset()
+@@ -168,6 +171,7 @@ class MarketSession:
+ 
+     def _stream_list(self) -> list[str]:
+         s = self.symbol.lower()
++        levels = int(get("orderbook.depth_stream_levels", 20))
+         return [
+             f"{s}@aggTrade",
+             f"{s}@kline_1m",
+@@ -178,6 +182,7 @@ class MarketSession:
+             f"{s}@kline_1d",
+             f"{s}@markPrice@1s",
+             f"{s}@ticker",
++            f"{s}@depth{levels}@100ms",
+             "!forceOrder@arr",
+         ]
+ 
+@@ -297,6 +302,9 @@ class MarketSession:
+                 rec = self.liqs.ingest_ws(data, self.symbol)
+                 if rec:
+                     self._status("liquidation", "live", f"{rec['liq_of']} @ {rec['price']}")
++            elif ev == "depthUpdate" or "@depth" in stream:
++                self.orderbook.on_depth(data)
++                self._status("orderbook", "live")
+         except Exception:
+             log.exception("ws handle %s", stream)
+ 
+@@ -400,6 +408,10 @@ class MarketSession:
+         )
+         oi_s = self.oi.snapshot()
+         fund_s = self.funding.snapshot()
++        ob_s = self.orderbook.imbalance(
++            float(get("orderbook.price_range_pct", 0.5)),
++            float(get("orderbook.thin_wall_ratio", 0.20)),
++        )
+         return {
+             "price": price,
+             "change_24h_pct": (self.ticker or {}).get("change_pct", 0.0),
+@@ -421,6 +433,7 @@ class MarketSession:
+             "liq_5m": self.liqs.stats(5 * 60_000),
+             "liq_15m": self.liqs.stats(15 * 60_000),
+             "structure": structure,
++            "orderbook": ob_s,
+         }
+ 
+     def _flush(self) -> None:
+@@ -583,8 +596,7 @@ class MarketSession:
+                     )
+                 },
+                 "oi_hist": self.oi.points.last(300),
+-                "funding_hist": self.funding.points.last(200),
+-                "cvd_tf": self.cvd.series(self.timeframe),
++                "funding_hist": self.funding.points.last(200),                "cvd_tf": self.cvd.series(self.timeframe),
+                 "liq_events": self.liqs.window(60 * 60_000),
+                 "footprint": fp,
+                 "footprint_stacks": stacks,
+diff --git a/src/orderbook.py b/src/orderbook.py
+new file mode 100644
+index 0000000..76da77c
+--- /dev/null
++++ b/src/orderbook.py
+@@ -0,0 +1,116 @@
++"""
++Order book depth tracker. Public partial-depth stream only
++(<symbol>@depth20@100ms) — resting liquidity, not executed volume.
++
++IMPORTANT CAVEAT (shows up in every reason string below): resting limit
++orders can be cancelled or replaced at any time before they trade. A "thin
++ask wall" means little size is CURRENTLY resting above price, not that a
++seller is unable or unwilling to add more. This is a snapshot of displayed
++liquidity, not a guarantee of what will happen when price gets there.
++"""
++
++from __future__ import annotations
++
++from src.utils import safe_float
++
++
++class OrderBookTracker:
++    def __init__(self):
++        self.bids: dict[float, float] = {}  # price -> qty
++        self.asks: dict[float, float] = {}
++        self.last_update_id = 0
++        self.last_ts = 0
++        self.source = "ws:<symbol>@depth20@100ms"
++
++    def reset(self) -> None:
++        self.bids.clear()
++        self.asks.clear()
++        self.last_update_id = 0
++        self.last_ts = 0
++
++    def on_depth(self, data: dict) -> None:
++        """
++        Binance Futures partial book depth payload:
++        {"e":"depthUpdate","E":..,"T":..,"s":"BTCUSDT","U":..,"u":..,
++         "b":[["px","qty"], ...], "a":[["px","qty"], ...]}
++        For the @depth20 partial-book stream, each message is a fresh top-20
++        snapshot (not a diff to apply), so we simply replace the book.
++        """
++        b = data.get("b") or data.get("bids") or []
++        a = data.get("a") or data.get("asks") or []
++        new_bids: dict[float, float] = {}
++        new_asks: dict[float, float] = {}
++        for px, qty in b:
++            p, q = safe_float(px), safe_float(qty)
++            if q > 0:
++                new_bids[p] = q
++        for px, qty in a:
++            p, q = safe_float(px), safe_float(qty)
++            if q > 0:
++                new_asks[p] = q
++        if not new_bids and not new_asks:
++            return
++        self.bids = new_bids
++        self.asks = new_asks
++        self.last_update_id = int(data.get("u") or data.get("lastUpdateId") or self.last_update_id)
++        self.last_ts = int(data.get("E") or data.get("T") or self.last_ts)
++
++    @property
++    def best_bid(self) -> float:
++        return max(self.bids) if self.bids else 0.0
++
++    @property
++    def best_ask(self) -> float:
++        return min(self.asks) if self.asks else 0.0
++
++    def imbalance(self, price_range_pct: float = 0.5, thin_wall_ratio: float = 0.20) -> dict:
++        bb, ba = self.best_bid, self.best_ask
++        if not bb or not ba:
++            return {
++                "ready": False,
++                "imbalance_ratio": 0.0,
++                "bid_notional": 0.0,
++                "ask_notional": 0.0,
++                "thin_ask_wall_above": False,
++                "thin_bid_wall_below": False,
++                "reason": "order book not yet populated",
++            }
++
++        bid_floor = bb * (1 - price_range_pct / 100.0)
++        ask_ceiling = ba * (1 + price_range_pct / 100.0)
++
++        bid_notional = sum(p * q for p, q in self.bids.items() if p >= bid_floor)
++        ask_notional = sum(p * q for p, q in self.asks.items() if p <= ask_ceiling)
++
++        total = bid_notional + ask_notional
++        imbalance_ratio = (bid_notional - ask_notional) / total if total > 0 else 0.0
++
++        thin_ask_wall_above = ask_notional > 0 and bid_notional > 0 and (ask_notional / bid_notional) < thin_wall_ratio
++        thin_bid_wall_below = bid_notional > 0 and ask_notional > 0 and (bid_notional / ask_notional) < thin_wall_ratio
++        # also treat a genuinely empty opposing side within the band as "thin"
++        if ask_notional == 0 and bid_notional > 0:
++            thin_ask_wall_above = True
++        if bid_notional == 0 and ask_notional > 0:
++            thin_bid_wall_below = True
++
++        reason = (
++            f"book imbalance {imbalance_ratio:+.2f} in \u00b1{price_range_pct:g}% band around "
++            f"best bid/ask: bid notional ${bid_notional:,.0f} vs ask notional ${ask_notional:,.0f} "
++            f"({'thin ask wall — little resting size above price' if thin_ask_wall_above else 'ask side not thin'}; "
++            f"{'thin bid wall — little resting size below price' if thin_bid_wall_below else 'bid side not thin'}) "
++            f"— snapshot of resting orders only, not proof of intent or that liquidity stays put"
++        )
++
++        return {
++            "ready": True,
++            "imbalance_ratio": round(imbalance_ratio, 4),
++            "bid_notional": round(bid_notional, 2),
++            "ask_notional": round(ask_notional, 2),
++            "thin_ask_wall_above": bool(thin_ask_wall_above),
++            "thin_bid_wall_below": bool(thin_bid_wall_below),
++            "best_bid": bb,
++            "best_ask": ba,
++            "ts": self.last_ts,
++            "source": self.source,
++            "reason": reason,
++        }
+diff --git a/src/scoring.py b/src/scoring.py
+index a106e12..b635480 100644
+--- a/src/scoring.py
++++ b/src/scoring.py
+@@ -191,6 +191,35 @@ class ScoreEngine:
+             reason = st.get("reason", "") + " (short-trap structure = near lows / failed breakdown)"
+         comps.append(_comp("price_structure", raw, raw, w.get("price_structure", 5), reason))
+ 
++        # --- order book imbalance (resting liquidity, not executed volume) ---
++        ob = s.get("orderbook") or {}
++        ratio = float(ob.get("imbalance_ratio") or 0.0)
++        if side == "long":
++            # A long trap is not "book looks bullish" — it's book LOOKS bullish
++            # (bid-heavy) while the ask side has almost nothing resting above
++            # price, so a small push clears it and invites longs into a
++            # vacuum with no real resistance-side absorption capacity behind
++            # it. Positive imbalance alone (bid-heavy) is weak evidence on its
++            # own; positive imbalance + a thin ask wall is the actual tell.
++            base = clip(ratio) if ratio > 0 else 0.0
++            thin = bool(ob.get("thin_ask_wall_above"))
++            raw = base * (1.0 if thin else 0.4)
++            reason = (
++                (ob.get("reason") or "order book not available")
++                + (" — bid-heavy book with thin resistance above = fragile-looking support, not proof of a trap"
++                   if thin and base > 0 else "")
++            )
++        else:
++            base = clip(-ratio) if ratio < 0 else 0.0
++            thin = bool(ob.get("thin_bid_wall_below"))
++            raw = base * (1.0 if thin else 0.4)
++            reason = (
++                (ob.get("reason") or "order book not available")
++                + (" — ask-heavy book with thin support below = fragile-looking resistance, not proof of a trap"
++                   if thin and base > 0 else "")
++            )
++        comps.append(_comp("book_imbalance", ratio, raw, w.get("book_imbalance", 10), reason))
++
+         total = round(sum(c.points for c in comps), 2)
+         return ScoreCard(total, 100.0, comps)
+ 
+diff --git a/tests/test_orderbook.py b/tests/test_orderbook.py
+new file mode 100644
+index 0000000..f885d24
+--- /dev/null
++++ b/tests/test_orderbook.py
+@@ -0,0 +1,67 @@
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.orderbook import OrderBookTracker
++
++
++def _depth(bids, asks, ts=1000):
++    """bids/asks: list of (price, qty) tuples."""
++    return {
++        "e": "depthUpdate",
++        "E": ts,
++        "b": [[str(p), str(q)] for p, q in bids],
++        "a": [[str(p), str(q)] for p, q in asks],
++    }
++
++
++def test_not_ready_before_any_update():
++    ob = OrderBookTracker()
++    out = ob.imbalance()
++    assert out["ready"] is False
++
++
++def test_balanced_book_near_zero_imbalance_no_thin_wall():
++    ob = OrderBookTracker()
++    bids = [(100 - i * 0.01, 10) for i in range(10)]
++    asks = [(100.01 + i * 0.01, 10) for i in range(10)]
++    ob.on_depth(_depth(bids, asks))
++    out = ob.imbalance(price_range_pct=0.5, thin_wall_ratio=0.20)
++    assert out["ready"] is True
++    assert abs(out["imbalance_ratio"]) < 0.05
++    assert out["thin_ask_wall_above"] is False
++    assert out["thin_bid_wall_below"] is False
++
++
++def test_heavy_bids_thin_asks_flags_thin_ask_wall():
++    ob = OrderBookTracker()
++    bids = [(100 - i * 0.01, 100) for i in range(10)]   # heavy resting bids
++    asks = [(100.01 + i * 0.01, 1) for i in range(10)]   # light resting asks
++    ob.on_depth(_depth(bids, asks))
++    out = ob.imbalance(price_range_pct=0.5, thin_wall_ratio=0.20)
++    assert out["imbalance_ratio"] > 0.5
++    assert out["thin_ask_wall_above"] is True
++    assert out["thin_bid_wall_below"] is False
++
++
++def test_heavy_asks_thin_bids_flags_thin_bid_wall():
++    ob = OrderBookTracker()
++    bids = [(100 - i * 0.01, 1) for i in range(10)]
++    asks = [(100.01 + i * 0.01, 100) for i in range(10)]
++    ob.on_depth(_depth(bids, asks))
++    out = ob.imbalance(price_range_pct=0.5, thin_wall_ratio=0.20)
++    assert out["imbalance_ratio"] < -0.5
++    assert out["thin_bid_wall_below"] is True
++    assert out["thin_ask_wall_above"] is False
++
++
++def test_price_range_pct_excludes_far_levels():
++    ob = OrderBookTracker()
++    # heavy bid support, but it's far outside the 0.1% band, so it shouldn't count
++    bids = [(100, 5), (90, 10_000)]
++    asks = [(100.05, 5)]
++    ob.on_depth(_depth(bids, asks))
++    out = ob.imbalance(price_range_pct=0.1, thin_wall_ratio=0.20)
++    # only the 100 bid level (within band) should count, not the 90 level
++    assert out["bid_notional"] < 1000
+diff --git a/tests/test_scoring.py b/tests/test_scoring.py
+index 3d873d7..7ba6135 100644
+--- a/tests/test_scoring.py
++++ b/tests/test_scoring.py
+@@ -23,6 +23,8 @@ def _base(**kw):
+                       "failed_breakout": False, "failed_breakdown": False, "reason": "none"},
+         "cvd_chg_5m": 0.0,
+         "cvd_chg_15m": 0.0,
++        "orderbook": {"ready": False, "imbalance_ratio": 0.0, "bid_notional": 0.0, "ask_notional": 0.0,
++                      "thin_ask_wall_above": False, "thin_bid_wall_below": False, "reason": "not populated"},
+     }
+     s.update(kw)
+     return s
+@@ -32,7 +34,7 @@ def test_neutral_scores_low():
+     out = ScoreEngine().compute(_base())
+     assert 0 <= out["long_setup"]["total"] <= 40
+     assert out["long_setup"]["total"] + 1e-9 >= 0
+-    assert len(out["long_setup"]["components"]) == 7
++    assert len(out["long_setup"]["components"]) == 8
+ 
+ 
+ def test_long_trap_setup_rises_with_crowding_and_div():
+@@ -80,3 +82,22 @@ def test_weights_sum_displayed():
+     out = ScoreEngine().compute(_base())
+     w = sum(c["weight"] for c in out["long_setup"]["components"])
+     assert abs(w - 100) < 1e-6
++
++
++def test_book_imbalance_raises_long_setup_only_with_thin_wall():
++    neutral = ScoreEngine().compute(
++        _base(orderbook={"ready": True, "imbalance_ratio": 0.6, "bid_notional": 80000,
++                          "ask_notional": 20000, "thin_ask_wall_above": False,
++                          "thin_bid_wall_below": False, "reason": "bid-heavy, ask not thin"})
++    )
++    thin = ScoreEngine().compute(
++        _base(orderbook={"ready": True, "imbalance_ratio": 0.6, "bid_notional": 80000,
++                          "ask_notional": 4000, "thin_ask_wall_above": True,
++                          "thin_bid_wall_below": False, "reason": "bid-heavy, thin ask wall"})
++    )
++    long_comp_neutral = next(c for c in neutral["long_setup"]["components"] if c["name"] == "book_imbalance")
++    long_comp_thin = next(c for c in thin["long_setup"]["components"] if c["name"] == "book_imbalance")
++    assert long_comp_thin["points"] > long_comp_neutral["points"] > 0
++    # short setup should not be boosted by a positive (bid-heavy) imbalance
++    short_comp_thin = next(c for c in thin["short_setup"]["components"] if c["name"] == "book_imbalance")
++    assert short_comp_thin["points"] == 0

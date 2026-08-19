@@ -23,6 +23,10 @@ def _base(**kw):
                       "failed_breakout": False, "failed_breakdown": False, "reason": "none"},
         "cvd_chg_5m": 0.0,
         "cvd_chg_15m": 0.0,
+        "orderbook": {"ready": False, "imbalance_ratio": 0.0, "bid_notional": 0.0, "ask_notional": 0.0,
+                      "thin_ask_wall_above": False, "thin_bid_wall_below": False, "reason": "not populated"},
+        "taker_ratio_1m": {"ratio": 0.0, "buy_vol": 0.0, "sell_vol": 0.0, "n": 0, "reason": "no trades"},
+        "taker_ratio_5m": {"ratio": 0.0, "buy_vol": 0.0, "sell_vol": 0.0, "n": 0, "reason": "no trades"},
     }
     s.update(kw)
     return s
@@ -32,7 +36,7 @@ def test_neutral_scores_low():
     out = ScoreEngine().compute(_base())
     assert 0 <= out["long_setup"]["total"] <= 40
     assert out["long_setup"]["total"] + 1e-9 >= 0
-    assert len(out["long_setup"]["components"]) == 7
+    assert len(out["long_setup"]["components"]) == 9
 
 
 def test_long_trap_setup_rises_with_crowding_and_div():
@@ -80,3 +84,44 @@ def test_weights_sum_displayed():
     out = ScoreEngine().compute(_base())
     w = sum(c["weight"] for c in out["long_setup"]["components"])
     assert abs(w - 100) < 1e-6
+
+
+def test_book_imbalance_raises_long_setup_only_with_thin_wall():
+    neutral = ScoreEngine().compute(
+        _base(orderbook={"ready": True, "imbalance_ratio": 0.6, "bid_notional": 80000,
+                          "ask_notional": 20000, "thin_ask_wall_above": False,
+                          "thin_bid_wall_below": False, "reason": "bid-heavy, ask not thin"})
+    )
+    thin = ScoreEngine().compute(
+        _base(orderbook={"ready": True, "imbalance_ratio": 0.6, "bid_notional": 80000,
+                          "ask_notional": 4000, "thin_ask_wall_above": True,
+                          "thin_bid_wall_below": False, "reason": "bid-heavy, thin ask wall"})
+    )
+    long_comp_neutral = next(c for c in neutral["long_setup"]["components"] if c["name"] == "book_imbalance")
+    long_comp_thin = next(c for c in thin["long_setup"]["components"] if c["name"] == "book_imbalance")
+    assert long_comp_thin["points"] > long_comp_neutral["points"] > 0
+    # short setup should not be boosted by a positive (bid-heavy) imbalance
+    short_comp_thin = next(c for c in thin["short_setup"]["components"] if c["name"] == "book_imbalance")
+    assert short_comp_thin["points"] == 0
+
+
+def test_taker_flow_rewards_intensifying_one_sided_buying():
+    base_kw = dict(
+        taker_ratio_1m={"ratio": 0.8, "buy_vol": 90, "sell_vol": 10, "n": 50, "reason": "1m heavy buy"},
+        taker_ratio_5m={"ratio": 0.5, "buy_vol": 300, "sell_vol": 100, "n": 200, "reason": "5m heavy buy"},
+    )
+    intensifying = ScoreEngine().compute(_base(**base_kw))
+
+    fading_kw = dict(
+        taker_ratio_1m={"ratio": 0.1, "buy_vol": 55, "sell_vol": 45, "n": 50, "reason": "1m cooling"},
+        taker_ratio_5m={"ratio": 0.5, "buy_vol": 300, "sell_vol": 100, "n": 200, "reason": "5m heavy buy"},
+    )
+    fading = ScoreEngine().compute(_base(**fading_kw))
+
+    ic = next(c for c in intensifying["long_setup"]["components"] if c["name"] == "taker_flow")
+    fc = next(c for c in fading["long_setup"]["components"] if c["name"] == "taker_flow")
+    assert ic["points"] > fc["points"] > 0
+
+    # heavy BUY flow should not boost the short setup's taker_flow component
+    short_c = next(c for c in intensifying["short_setup"]["components"] if c["name"] == "taker_flow")
+    assert short_c["points"] == 0

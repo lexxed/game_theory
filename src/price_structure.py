@@ -111,6 +111,8 @@ class PriceStructure:
 
         failed_breakout = False
         failed_breakdown = False
+        breakout = False
+        breakdown = False
         if len(bars) >= 4 and a > 0:
             # broke above prior 10-bar high then closed back inside
             prior_high = max(highs[-12:-2]) if len(highs) >= 12 else max(highs[:-2])
@@ -119,6 +121,12 @@ class PriceStructure:
                 failed_breakout = True
             if min(lows[-2:]) < prior_low and closes[-1] > prior_low:
                 failed_breakdown = True
+            # clean breakout/breakdown: a discrete close-over-close crossing of the
+            # prior range level, not a same-bar wick-and-reject (that's the failed_* case above).
+            if len(closes) >= 2 and closes[-2] <= prior_high < closes[-1]:
+                breakout = True
+            if len(closes) >= 2 and closes[-2] >= prior_low > closes[-1]:
+                breakdown = True
 
         return {
             "near_high": bool(near_high),
@@ -127,17 +135,20 @@ class PriceStructure:
             "lost_resistance": lost_resistance,
             "failed_breakout": failed_breakout,
             "failed_breakdown": failed_breakdown,
+            "breakout": breakout,
+            "breakdown": breakdown,
             "swing_high": swing_high,
             "swing_low": swing_low,
             "atr": a,
             "price": px,
             "reason": self._reason(
-                near_high, near_low, lost_support, lost_resistance, failed_breakout, failed_breakdown
+                near_high, near_low, lost_support, lost_resistance,
+                failed_breakout, failed_breakdown, breakout, breakdown,
             ),
         }
 
     @staticmethod
-    def _reason(nh, nl, ls, lr, fb, fd) -> str:
+    def _reason(nh, nl, ls, lr, fb, fd, bo=False, bd=False) -> str:
         bits = []
         if nh:
             bits.append("price is near local high")
@@ -151,4 +162,8 @@ class PriceStructure:
             bits.append("failed breakout (traded above range, closed back inside)")
         if fd:
             bits.append("failed breakdown (traded below range, closed back inside)")
+        if bo:
+            bits.append("breakout (close crossed and held above prior range high)")
+        if bd:
+            bits.append("breakdown (close crossed and held below prior range low)")
         return "; ".join(bits) if bits else "no notable structure event"

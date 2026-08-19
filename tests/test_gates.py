@@ -75,9 +75,30 @@ def test_long_trap_confirmed_needs_structure_and_flow():
     assert g["trade_status"] == "LONG-TRAP CONFIRMING"
 
 
-def test_failed_breakout_plus_long_liq_confirms():
+def test_failed_breakout_plus_tiny_liq_does_not_confirm():
     snap = _base(
         liq_15m={"long_notional": 10, "short_notional": 0, "long_n": 1, "short_n": 0},
+        structure={
+            "near_high": True,
+            "near_low": False,
+            "lost_support": False,
+            "lost_resistance": False,
+            "failed_breakout": True,
+            "failed_breakdown": False,
+            "reason": "failed bo",
+        },
+    )
+    g = evaluate(snap, ScoreEngine().compute(snap))
+    assert g["long_liq_event"] is True
+    assert g["long_trap_confirmation"] is False
+
+
+def test_failed_breakout_plus_bearish_flow_confirms():
+    snap = _base(
+        cvd_chg_5m=-8,
+        price_chg_5m_pct=-0.2,
+        price_chg_15m_pct=-0.2,
+        oi_chg_15m_pct=-0.2,
         structure={
             "near_high": True,
             "near_low": False,
@@ -144,28 +165,43 @@ def test_cascade_fires_when_liq_and_intensity():
     assert sm.update(scores, snap) == "LONG LIQUIDATION CASCADE"
 
 
-def test_forced_flow_threshold():
+def test_forced_flow_ignores_notional_without_direction():
     snap = _base(liq_15m={"long_notional": 60000, "short_notional": 0, "long_n": 2, "short_n": 0})
     g = evaluate(snap, ScoreEngine().compute(snap))
-    assert g["long_forced_flow"] is True
+    assert g["long_liq_event"] is True
+    assert g["long_forced_flow"] is False
     assert g["short_forced_flow"] is False
-    assert g["trade_status"] == "LONG FORCED-FLOW"
+    assert g["trade_status"] == "WAIT"
 
 
-def test_squeeze_still_needs_opposite_liq():
-    from src.scoring import ScoreEngine
-
-    no_liq = _base(oi_chg_15m_pct=-0.2, price_chg_15m_pct=0.2, cvd_chg_15m=10)
+def test_squeeze_needs_meaningful_liq_and_uses_canonical_names():
+    no_liq = _base(
+        oi_chg_15m_pct=-0.2,
+        price_chg_15m_pct=0.2,
+        cvd_chg_15m=10,
+        cvd_chg_5m=10,
+    )
+    tiny = _base(
+        oi_chg_15m_pct=-0.2,
+        price_chg_15m_pct=0.2,
+        cvd_chg_15m=10,
+        cvd_chg_5m=10,
+        liq_15m={"long_notional": 0, "short_notional": 1, "long_n": 0, "short_n": 1},
+    )
     yes = _base(
         oi_chg_15m_pct=-0.2,
         price_chg_15m_pct=0.2,
         cvd_chg_15m=10,
-        liq_15m={"long_notional": 0, "short_notional": 1, "long_n": 0, "short_n": 1},
+        cvd_chg_5m=10,
+        liq_15m={"long_notional": 0, "short_notional": 200000, "long_n": 0, "short_n": 4},
     )
     a = ScoreEngine().compute(no_liq)
-    b = ScoreEngine().compute(yes)
-    assert a["squeeze"]["long_squeeze"] is False
-    assert b["squeeze"]["long_squeeze"] is True
+    b = ScoreEngine().compute(tiny)
+    c = ScoreEngine().compute(yes)
+    assert a["squeeze"]["short_squeeze"] is False
+    assert b["squeeze"]["short_squeeze"] is False
+    assert c["squeeze"]["short_squeeze"] is True
+    assert c["squeeze"]["long_squeeze"] is False
 
 
 def test_watch_status_from_setup_only():

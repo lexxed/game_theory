@@ -56,7 +56,7 @@ def interpret(symbol: str, snap: dict, scores: dict, state: str, reason: str) ->
         "INTERPRETATION (not a forecast)",
         f"  Long trap setup {ls:.0f}/100  confirm {lc:.0f}/100",
         f"  Short trap setup {ss:.0f}/100  confirm {sc:.0f}/100",
-        f"  Cascade intensity  long {scores.get('cascade_long', 0):.0f}  short {scores.get('cascade_short', 0):.0f}",
+        f"  Cascade intensity (NOT a cascade)  long {scores.get('cascade_long', 0):.0f}  short {scores.get('cascade_short', 0):.0f}",
         f"  State reason: {reason}",
         "",
         "CURRENT GAME",
@@ -74,13 +74,17 @@ def interpret(symbol: str, snap: dict, scores: dict, state: str, reason: str) ->
 
 def _headline(state: str, ls, lc, ss, sc) -> str:
     if "LONG LIQUIDATION CASCADE" in state:
-        return "FORCED FLOW: observed long liquidations + shrinking OI + falling price."
+        return "LONG CASCADE: meaningful long liquidations + shrinking OI + falling price + falling CVD."
     if "SHORT LIQUIDATION CASCADE" in state:
-        return "FORCED FLOW: observed short liquidations + shrinking OI + rising price."
+        return "SHORT CASCADE: meaningful short liquidations + shrinking OI + rising price + rising CVD."
     if state == "LONG SQUEEZE":
-        return "SHORTS LOOK SQUEEZED (price up, OI down, short liqs) — could also be voluntary short covering."
+        return "LONGS LOOK SQUEEZED (price down, OI down, CVD down, meaningful long liqs) — could also be voluntary covering."
     if state == "SHORT SQUEEZE":
-        return "LONGS LOOK SQUEEZED (price down, OI down, long liqs) — could also be voluntary long covering."
+        return "SHORTS LOOK SQUEEZED (price up, OI down, CVD up, meaningful short liqs) — could also be voluntary covering."
+    if state == "LONG FORCED FLOW":
+        return "LONG FORCED FLOW: meaningful long liquidations with falling price, falling CVD, and declining OI. Not a trap by itself."
+    if state == "SHORT FORCED FLOW":
+        return "SHORT FORCED FLOW: meaningful short liquidations with rising price, rising CVD, and declining OI. Not a trap by itself."
     if "LONG TRAP" in state:
         return "LONG-SIDE VULNERABILITY (setup). Confirmed only if structure+flow GATE is true — not via confirm score."
     if "SHORT TRAP" in state:
@@ -93,6 +97,10 @@ def _headline(state: str, ls, lc, ss, sc) -> str:
         return "BREAKOUT FAILED — range high was traded and rejected."
     if "FAILED BREAKDOWN" in state:
         return "BREAKDOWN FAILED — range low was traded and rejected."
+    if state == "BREAKOUT":
+        return "CLEAN BREAKOUT — close held above prior range high with OI expanding and CVD confirming."
+    if state == "BREAKDOWN":
+        return "CLEAN BREAKDOWN — close held below prior range low with OI expanding and CVD confirming."
     if "LONG-SIDE CROWDING" in state:
         return "LONG-SIDE CROWDING ESTIMATE — funding/account-ratio PROXY, not actual long OI."
     if "SHORT-SIDE CROWDING" in state:
@@ -127,5 +135,15 @@ def _invalidate(state: str, snap: dict) -> str:
             "  • Price loses the reclaimed level and makes a clean lower low with CVD confirmation.\n"
             "  • OI expands into the decline again.\n"
             "  • Observed short-liquidation flow dries up."
+        )
+    if state == "BREAKOUT":
+        return (
+            "  • Price closes back below the broken range high (reverts to failed-breakout territory).\n"
+            "  • OI stops expanding or CVD stops following — conviction was not real."
+        )
+    if state == "BREAKDOWN":
+        return (
+            "  • Price closes back above the broken range low (reverts to failed-breakdown territory).\n"
+            "  • OI stops expanding or CVD stops following — conviction was not real."
         )
     return "  • A one-sided combination of OI + CVD + observed liquidations + structure break."

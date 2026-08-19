@@ -69,6 +69,9 @@ class ScoreEngine:
             "short_confirm": short_conf.as_dict(),
             "cascade_long": cascade["long"],
             "cascade_short": cascade["short"],
+            "cascade_long_intensity": cascade["long"],
+            "cascade_short_intensity": cascade["short"],
+            "cascade_note": cascade.get("note", ""),
             "squeeze": squeeze,
         }
 
@@ -191,6 +194,66 @@ class ScoreEngine:
             reason = st.get("reason", "") + " (short-trap structure = near lows / failed breakdown)"
         comps.append(_comp("price_structure", raw, raw, w.get("price_structure", 5), reason))
 
+        # --- order book imbalance (resting liquidity, not executed volume) ---
+        ob = s.get("orderbook") or {}
+        ratio = float(ob.get("imbalance_ratio") or 0.0)
+        if side == "long":
+            # A long trap is not "book looks bullish" — it's book LOOKS bullish
+            # (bid-heavy) while the ask side has almost nothing resting above
+            # price, so a small push clears it and invites longs into a
+            # vacuum with no real resistance-side absorption capacity behind
+            # it. Positive imbalance alone (bid-heavy) is weak evidence on its
+            # own; positive imbalance + a thin ask wall is the actual tell.
+            base = clip(ratio) if ratio > 0 else 0.0
+            thin = bool(ob.get("thin_ask_wall_above"))
+            raw = base * (1.0 if thin else 0.4)
+            reason = (
+                (ob.get("reason") or "order book not available")
+                + (" — bid-heavy book with thin resistance above = fragile-looking support, not proof of a trap"
+                   if thin and base > 0 else "")
+            )
+        else:
+            base = clip(-ratio) if ratio < 0 else 0.0
+            thin = bool(ob.get("thin_bid_wall_below"))
+            raw = base * (1.0 if thin else 0.4)
+            reason = (
+                (ob.get("reason") or "order book not available")
+                + (" — ask-heavy book with thin support below = fragile-looking resistance, not proof of a trap"
+                   if thin and base > 0 else "")
+            )
+        comps.append(_comp("book_imbalance", ratio, raw, w.get("book_imbalance", 10), reason))
+
+        # --- taker buy/sell flow ratio (relative one-sidedness, not cumulative like CVD) ---
+        t1 = s.get("taker_ratio_1m") or {}
+        t5 = s.get("taker_ratio_5m") or {}
+        r1 = float(t1.get("ratio") or 0.0)
+        r5 = float(t5.get("ratio") or 0.0)
+        if side == "long":
+            # Heavy one-sided BUY flow is the demand-side crowding signal: if
+            # nearly everyone aggressive lately has been buying, most of the
+            # willing buyers may already be in — vulnerable to a flush once
+            # that flow dries up. Weighted higher when the very recent (1m)
+            # ratio is running hotter than the 5m ratio (flow still
+            # intensifying, not already fading).
+            base = clip(r5) if r5 > 0 else 0.0
+            intensifying = r1 >= r5
+            raw = base * (1.0 if intensifying else 0.5)
+            reason = (
+                (t5.get("reason") or "taker flow not available")
+                + (f" | 1m ratio {r1:+.2f} {'confirms' if intensifying else 'is fading vs'} 5m"
+                   if base > 0 else "")
+            )
+        else:
+            base = clip(-r5) if r5 < 0 else 0.0
+            intensifying = r1 <= r5
+            raw = base * (1.0 if intensifying else 0.5)
+            reason = (
+                (t5.get("reason") or "taker flow not available")
+                + (f" | 1m ratio {r1:+.2f} {'confirms' if intensifying else 'is fading vs'} 5m"
+                   if base > 0 else "")
+            )
+        comps.append(_comp("taker_flow", r5, raw, w.get("taker_flow", 10), reason))
+
         total = round(sum(c.points for c in comps), 2)
         return ScoreCard(total, 100.0, comps)
 
@@ -207,14 +270,14 @@ class ScoreEngine:
         liq5 = s.get("liq_5m") or {}
 
         if side == "long":
-            lost = bool(st.get("lost_support"))
+            lost = bool(st.get("lost_support") or st.get("failed_breakout"))
             comps.append(
                 _comp(
                     "support_break",
                     float(lost),
                     float(lost),
                     w.get("support_break", 25),
-                    "price lost local support" if lost else "local support still holds",
+                    "failed breakout / lost support" if lost else "local support still holds (no failed breakout)",
                 )
             )
             unwind = oi15 < 0 and px15 < 0
@@ -231,16 +294,22 @@ class ScoreEngine:
             )
             long_liq = float(liq.get("long_notional") or 0.0)
             long_liq5 = float(liq5.get("long_notional") or 0.0)
-            liq_n = clip(long_liq / float(get("scoring_refs.liq_notional_ref", 250000)))
-            if long_liq5 > long_liq * 0.4 and long_liq5 > 0:
-                liq_n = clip(liq_n + 0.2)
+            # Long-trap confirmation liq only counts into a decline (against longs).
+            liq_n = 0.0
+            liq_reason = f"OBSERVED long liq 15m ${long_liq:,.0f} / 5m ${long_liq5:,.0f}"
+            if long_liq > 0 and px15 < 0:
+                liq_n = clip(long_liq / float(get("scoring_refs.liq_notional_ref", 250000)))
+                if long_liq5 > long_liq * 0.4 and long_liq5 > 0:
+                    liq_n = clip(liq_n + 0.2)
+            elif long_liq > 0:
+                liq_reason += " — ignored: long liqs while price is not falling do not confirm a long trap"
             comps.append(
                 _comp(
                     "liquidation_flow",
                     long_liq,
                     liq_n,
                     w.get("liquidation_flow", 25),
-                    f"OBSERVED long liq 15m ${long_liq:,.0f} / 5m ${long_liq5:,.0f}",
+                    liq_reason,
                 )
             )
             follow = cvd5 < 0 and px5 < 0
@@ -264,14 +333,14 @@ class ScoreEngine:
                 )
             )
         else:
-            lost = bool(st.get("lost_resistance"))
+            lost = bool(st.get("lost_resistance") or st.get("failed_breakdown"))
             comps.append(
                 _comp(
                     "resistance_break",
                     float(lost),
                     float(lost),
                     w.get("support_break", 25),
-                    "price broke local resistance" if lost else "local resistance still holds",
+                    "failed breakdown / lost resistance" if lost else "local resistance still holds (no failed breakdown)",
                 )
             )
             unwind = oi15 < 0 and px15 > 0
@@ -288,14 +357,22 @@ class ScoreEngine:
             )
             short_liq = float(liq.get("short_notional") or 0.0)
             short_liq5 = float(liq5.get("short_notional") or 0.0)
-            liq_n = clip(short_liq / float(get("scoring_refs.liq_notional_ref", 250000)))
+            # Short-trap confirmation liq only counts into a rally (against shorts).
+            liq_n = 0.0
+            liq_reason = f"OBSERVED short liq 15m ${short_liq:,.0f} / 5m ${short_liq5:,.0f}"
+            if short_liq > 0 and px15 > 0:
+                liq_n = clip(short_liq / float(get("scoring_refs.liq_notional_ref", 250000)))
+                if short_liq5 > short_liq * 0.4 and short_liq5 > 0:
+                    liq_n = clip(liq_n + 0.2)
+            elif short_liq > 0:
+                liq_reason += " — ignored: short liqs while price is not rising do not confirm a short trap"
             comps.append(
                 _comp(
                     "liquidation_flow",
                     short_liq,
                     liq_n,
                     w.get("liquidation_flow", 25),
-                    f"OBSERVED short liq 15m ${short_liq:,.0f} / 5m ${short_liq5:,.0f}",
+                    liq_reason,
                 )
             )
             follow = cvd5 > 0 and px5 > 0
@@ -343,30 +420,70 @@ class ScoreEngine:
         return {
             "long": side_score(price_down=True),
             "short": side_score(price_down=False),
+            "note": "INTENSITY only (price/OI/CVD). Not an actual cascade. See gates.long_cascade / short_cascade.",
         }
 
     def _squeeze(self, s: dict) -> dict:
         """
-        Long squeeze / short covering: price↑ OI↓ CVD↑ short liqs↑
-        Short squeeze / long covering: price↓ OI↓ CVD↓ long liqs↑
-        OI down + price move can also be voluntary closing — require liq confirmation.
+        SHORT SQUEEZE = shorts being forced out:
+            price rising strongly + CVD up + OI falling + meaningful short liq
+        LONG SQUEEZE = longs being forced out:
+            price falling strongly + CVD down + OI falling + meaningful long liq
+
+        A liquidation print of $1 (or any notional > 0) is NOT a squeeze.
+        OI down + price move can also be voluntary covering — require meaningful liq.
         """
+        from src.liquidations import classify_liquidation, oi_usdt
+
         oi15 = float(s.get("oi_chg_15m_pct") or 0.0)
         px15 = float(s.get("price_chg_15m_pct") or 0.0)
         cvd15 = float(s.get("cvd_chg_15m") or 0.0)
+        cvd5 = float(s.get("cvd_chg_5m") or 0.0)
         liq = s.get("liq_15m") or {}
         cfg = get("squeeze", {})
+        gcfg = get("gates", {})
         need_oi = float(cfg.get("oi_drop_pct", 0.08))
         need_px = float(cfg.get("price_move_pct", 0.08))
         short_liq = float(liq.get("short_notional") or 0.0)
         long_liq = float(liq.get("long_notional") or 0.0)
-        long_sq = oi15 <= -need_oi and px15 >= need_px and cvd15 > 0 and short_liq > 0
-        short_sq = oi15 <= -need_oi and px15 <= -need_px and cvd15 < 0 and long_liq > 0
+        base = s.get("liq_baseline") or {}
+        short_sig = classify_liquidation(
+            short_liq,
+            oi_usdt_value=oi_usdt(s),
+            median=float((base.get("short") or {}).get("median") or 0.0),
+            history=list((base.get("short") or {}).get("history") or []),
+            cfg=gcfg,
+        )
+        long_sig = classify_liquidation(
+            long_liq,
+            oi_usdt_value=oi_usdt(s),
+            median=float((base.get("long") or {}).get("median") or 0.0),
+            history=list((base.get("long") or {}).get("history") or []),
+            cfg=gcfg,
+        )
+        cvd_up = cvd15 > 0 or (cvd5 > 0 and cvd15 >= 0)
+        cvd_down = cvd15 < 0 or (cvd5 < 0 and cvd15 <= 0)
+        # Canonical names (fixed inversion): short_squeeze = shorts squeezed.
+        short_sq = (
+            oi15 <= -need_oi
+            and px15 >= need_px
+            and cvd_up
+            and short_sig["is_meaningful"]
+        )
+        long_sq = (
+            oi15 <= -need_oi
+            and px15 <= -need_px
+            and cvd_down
+            and long_sig["is_meaningful"]
+        )
         return {
-            "long_squeeze": bool(long_sq),  # shorts squeezed
-            "short_squeeze": bool(short_sq),  # longs squeezed
+            "long_squeeze": bool(long_sq),
+            "short_squeeze": bool(short_sq),
+            "short_liq_level": short_sig["level"],
+            "long_liq_level": long_sig["level"],
             "reason": (
-                f"OI {oi15:+.3f}% price {px15:+.3f}% CVD15 {cvd15:+.4g} "
-                f"shortLiq ${short_liq:,.0f} longLiq ${long_liq:,.0f}"
+                f"OI {oi15:+.3f}% price {px15:+.3f}% CVD15 {cvd15:+.4g} CVD5 {cvd5:+.4g} "
+                f"shortLiq ${short_liq:,.0f} ({short_sig['level']}) "
+                f"longLiq ${long_liq:,.0f} ({long_sig['level']})"
             ),
         }

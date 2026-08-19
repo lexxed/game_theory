@@ -10,6 +10,8 @@ binance:
   # 2026 USD-M public market path. Legacy /ws and /stream time out.
   ws_combined: "wss://fstream.binance.com/market/stream"
   ws_raw: "wss://fstream.binance.com/market/ws"
+  # Depth / bookTicker are high-frequency PUBLIC streams (not /market).
+  ws_public_combined: "wss://fstream.binance.com/public/stream"
   request_timeout_s: 12
   rest_retries: 3
   rest_backoff_s: 0.6
@@ -38,6 +40,7 @@ stale_after_s:
   oi: 20
   funding: 20
   kline: 90
+  orderbook: 8
   # Liquidations are event-driven. No event != stale if the socket is up.
   liquidation_socket: 15
 
@@ -86,10 +89,22 @@ cascade:
   exit: 50
 
 # Gating: confirmation is structure+flow, not the 0-100 confirm score.
+# Liquidation EVENT (any print) is not forced-flow. Significance is normalized
+# vs OI and/or a rolling baseline — a fixed $50k print is not automatically
+# meaningful on a large book.
 gates:
   setup_watch: 70
-  forced_flow_notional: 50000
+  liq_min_notional: 25000            # below this = tiny event, never meaningful
+  forced_flow_notional: 50000        # fallback floor ONLY when OI/baseline missing
+  liq_to_oi_ratio: 0.0005            # 0.05% of OI USDT → meaningful
+  liq_to_oi_extreme: 0.002           # 0.20% of OI USDT → extreme
+  liq_spike_multiplier: 4.0          # vs rolling median 15m notional
+  liq_spike_extreme: 8.0
+  liq_significance_pctile: 80
+  liq_extreme_pctile: 95
+  liq_baseline_min_windows: 4
   cascade_min_observed_notional: 100000
+  cascade_min_liq_to_oi: 0.001       # 0.10% of OI USDT
 
 squeeze:
   oi_drop_pct: 0.08
@@ -106,14 +121,20 @@ state_machine:
   crowding_enter: 60
 
 # Setup scores (must sum to 100)
+# NOTE: weights have been trimmed twice (proportionally, rounded) to make
+# room first for book_imbalance, then for taker_flow, below. Rebalance
+# further to taste — the code doesn't require this to sum to exactly 100,
+# but the dashboard's score display assumes a 0-100 scale by convention.
 weights_setup:
-  crowding: 15
-  oi_behavior: 15
-  funding: 10
-  cvd_divergence: 20
-  absorption: 20
-  liquidation_risk: 15
+  crowding: 11
+  oi_behavior: 12
+  funding: 8
+  cvd_divergence: 16
+  absorption: 16
+  liquidation_risk: 13
   price_structure: 5
+  book_imbalance: 9
+  taker_flow: 10
 
 # Confirmation scores (must sum to 100)
 weights_confirm:
@@ -129,6 +150,12 @@ scoring_refs:
   stall_gap_pct: 0.25
   liq_notional_ref: 250000.0    # USDT, 15m window, scale per symbol later
   near_extreme_pct: 0.15
+
+orderbook:
+  depth_stream_levels: 20        # matches <symbol>@depth20@100ms
+  price_range_pct: 0.5           # band above/below best bid/ask to sum notional in
+  thin_wall_ratio: 0.20          # ask (or bid) notional below this fraction of the
+                                  # opposing side's notional in the same band = "thin wall"
 
 grok:
   enabled: true

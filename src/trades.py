@@ -101,3 +101,29 @@ class TradeTape:
             "first_px": first_px,
             "last_px": last_px,
         }
+
+    def taker_ratio(self, lookback_ms: int, label: str = "") -> dict:
+        """
+        Rolling taker buy/sell volume ratio over the last `lookback_ms`.
+        Complementary to CVD: CVD is a running cumulative total, this is a
+        bounded relative measure of how one-sided RECENT flow is, independent
+        of how large the absolute move has been. ratio in [-1, 1]:
+        +1 = all buy-side aggression, -1 = all sell-side aggression, 0 = even.
+        """
+        st = self.window_stats(lookback_ms)
+        buy, sell = st["buy_vol"], st["sell_vol"]
+        total = buy + sell
+        ratio = (buy - sell) / total if total > 0 else 0.0
+        lbl = label or f"{lookback_ms // 60_000}m"
+        return {
+            "ratio": round(ratio, 4),
+            "buy_vol": buy,
+            "sell_vol": sell,
+            "n": st["n"],
+            "reason": (
+                f"taker flow {lbl}: buy {buy:,.3f} vs sell {sell:,.3f} "
+                f"(ratio {ratio:+.2f}) — relative one-sidedness of recent aggressive "
+                f"volume, not a cumulative total like CVD, and not proof of net "
+                f"positioning by itself"
+            ),
+        }

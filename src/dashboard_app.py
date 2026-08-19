@@ -5,9 +5,11 @@ from __future__ import annotations
 import html as html_lib
 import importlib
 import json
+import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 
 import ipywidgets as W
 import pandas as pd
@@ -16,6 +18,10 @@ from IPython.display import Javascript, display
 
 from src import grok_interface
 from src.market_data import MarketSession
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # Keep a local copy so a stale Jupyter `src.utils` cannot break START.
 _TF_ALIAS = {"4H": "4h", "24H": "1d", "24h": "1d", "1H": "1h", "1D": "1d"}
@@ -26,7 +32,7 @@ def _tf(tf: str) -> str:
     return _TF_ALIAS.get(raw) or _TF_ALIAS.get(raw.lower(), raw.lower())
 
 
-def format_copy_snapshot(snap: dict, symbol_override: str = "") -> str:
+def format_copy_snapshot(snap: dict, symbol_override: str = "", grok_comment: str = "") -> str:
     """Plain-text dump of STATE, KPIs, and scores for clipboard."""
     from datetime import datetime, timezone
 
@@ -72,21 +78,31 @@ def format_copy_snapshot(snap: dict, symbol_override: str = "") -> str:
         *card_lines("SHORT TRAP CONFIRM", sc.get("short_confirm") or {}),
         "",
         f"TRADE STATUS        {(snap.get('trade_status') or (sc.get('gates') or {}).get('trade_status'))}",
-        f"LONG VULN/CONF/FF   {(sc.get('gates') or {}).get('long_vulnerability')} / "
-        f"{(sc.get('gates') or {}).get('long_trap_confirmation')} / "
-        f"{(sc.get('gates') or {}).get('long_forced_flow')}",
-        f"SHORT VULN/CONF/FF  {(sc.get('gates') or {}).get('short_vulnerability')} / "
-        f"{(sc.get('gates') or {}).get('short_trap_confirmation')} / "
-        f"{(sc.get('gates') or {}).get('short_forced_flow')}",
-        f"CASCADE long/short  {sc.get('cascade_long')} / {sc.get('cascade_short')}",
-        f"SQUEEZE  {sc.get('squeeze')}",
+        f"TRADE REASON        {(sc.get('gates') or {}).get('trade_status_reason')}",
+        f"LONG LIQ EVENT      {(sc.get('gates') or {}).get('long_liq_event')}  level={(sc.get('gates') or {}).get('long_liq_level')}",
+        f"LONG FORCED FLOW    {(sc.get('gates') or {}).get('long_forced_flow')}",
+        f"LONG TRAP SETUP     {(sc.get('gates') or {}).get('long_vulnerability')}  CONFIRM={(sc.get('gates') or {}).get('long_trap_confirmation')}",
+        f"LONG SQUEEZE        {(sc.get('gates') or {}).get('long_squeeze')}",
+        f"SHORT LIQ EVENT     {(sc.get('gates') or {}).get('short_liq_event')}  level={(sc.get('gates') or {}).get('short_liq_level')}",
+        f"SHORT FORCED FLOW   {(sc.get('gates') or {}).get('short_forced_flow')}",
+        f"SHORT TRAP SETUP    {(sc.get('gates') or {}).get('short_vulnerability')}  CONFIRM={(sc.get('gates') or {}).get('short_trap_confirmation')}",
+        f"SHORT SQUEEZE       {(sc.get('gates') or {}).get('short_squeeze')}",
+        f"CASCADE INTENSITY L/S  {sc.get('cascade_long')} / {sc.get('cascade_short')}  (price/OI/CVD only, not a cascade)",
+        f"CASCADE GATE L/S    {(sc.get('gates') or {}).get('long_cascade')} / {(sc.get('gates') or {}).get('short_cascade')}",
+        f"SQUEEZE DETAIL      {sc.get('squeeze')}",
         f"CVD DIV  {div.get('reason')}",
         f"ABSORB   {ab.get('reason')}",
         f"STRUCT   {st.get('reason')}",
         "",
+        (sc.get("gates") or {}).get("explanation_text") or "",
+        "",
         "LIMITS: OI is not side-identified. Funding is not positioning.",
         "CVD is aggressive flow. Liquidations are OBSERVED force-orders only.",
+        "A liquidation EVENT is not forced-flow, a trap, or a squeeze.",
         "High setup is not a price forecast.",
+        "",
+        "GROK COMMENT",
+        grok_comment.strip() if (grok_comment or "").strip() else "(none — click Grok comment first)",
     ]
     return "\n".join(str(x) for x in lines)
 
@@ -113,23 +129,66 @@ def _yn(flag: bool) -> str:
 def _gates_html(s: dict) -> str:
     g = s.get("gates") or (s.get("scores") or {}).get("gates") or {}
     status = s.get("trade_status") or g.get("trade_status") or "WAIT"
+    expl = html_lib.escape(g.get("explanation_text") or g.get("trade_status_reason") or "")
+    expl_html = expl.replace("\n", "<br>")
     return f"""
     <div style="font-family:Segoe UI,system-ui,sans-serif;margin:8px 0">
       {_card("TRADE STATUS", status)}
       <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:8px">
-        {_card("LONG VULNERABILITY", f"{g.get('long_vulnerability', 0):.0f}/100")}
-        {_card("LONG TRAP CONFIRMATION", _yn(bool(g.get('long_trap_confirmation'))))}
-        {_card("LONG FORCED-FLOW", _yn(bool(g.get('long_forced_flow'))))}
-        {_card("SHORT VULNERABILITY", f"{g.get('short_vulnerability', 0):.0f}/100")}
-        {_card("SHORT TRAP CONFIRMATION", _yn(bool(g.get('short_trap_confirmation'))))}
-        {_card("SHORT FORCED-FLOW", _yn(bool(g.get('short_forced_flow'))))}
+        {_card("LONG LIQ EVENT", _yn(bool(g.get("long_liq_event"))))}
+        {_card("LONG FORCED FLOW", _yn(bool(g.get("long_forced_flow"))))}
+        {_card("LONG TRAP SETUP", f"{g.get('long_vulnerability', 0):.0f}/100")}
+        {_card("LONG TRAP CONFIRM", _yn(bool(g.get("long_trap_confirmation"))))}
+        {_card("LONG SQUEEZE", _yn(bool(g.get("long_squeeze"))))}
+        {_card("SHORT LIQ EVENT", _yn(bool(g.get("short_liq_event"))))}
+        {_card("SHORT FORCED FLOW", _yn(bool(g.get("short_forced_flow"))))}
+        {_card("SHORT TRAP SETUP", f"{g.get('short_vulnerability', 0):.0f}/100")}
+        {_card("SHORT TRAP CONFIRM", _yn(bool(g.get("short_trap_confirmation"))))}
+        {_card("SHORT SQUEEZE", _yn(bool(g.get("short_squeeze"))))}
+        {_card("CASCADE INTENSITY L/S", f"{g.get('cascade_long_intensity', 0):.0f} / {g.get('cascade_short_intensity', 0):.0f}")}
+        {_card("CASCADE GATE L/S", f"{_yn(bool(g.get('long_cascade')))} / {_yn(bool(g.get('short_cascade')))}")}
+      </div>
+      <div style="font-size:11px;color:#333;margin-top:8px;white-space:normal;line-height:1.35">
+        {expl_html}
       </div>
       <div style="font-size:11px;color:#555;margin-top:6px">
-        Confirmation is a structure+flow GATE. Confirm score is diagnostic only.
+        A liquidation EVENT is not forced-flow. Confirmation is a structure+flow GATE.
+        Confirm score is diagnostic only. Cascade intensity is price/OI/CVD, not a cascade.
         Crowding is a PROXY, not OI positioning. Analysis only — no orders.
       </div>
     </div>
     """
+
+
+def _backtest_html(symbol: str, tf: str, col: str, thresh: float, n_scores: int, n_ev: int, summary) -> str:
+    head = (
+        f"<div style='font-family:Segoe UI,system-ui,sans-serif;font-size:13px'>"
+        f"<b>BACKTEST</b> {symbol} {tf} &nbsp; {col} ≥ {thresh:g} &nbsp; "
+        f"(session snapshots n={n_scores}, events with forward bars n={n_ev})<br>"
+        f"<span style='color:#555'>pct_price_down = P(close lower after that horizon). "
+        f"Setup ≥ 60 is vulnerability, not a confirmed short. Not a proven edge.</span>"
+    )
+    if summary is None or (hasattr(summary, "empty") and summary.empty) or n_ev == 0:
+        return head + "<div style='margin-top:8px'>No events with enough forward candles. Keep START running, then try again.</div></div>"
+    cols = [c for c in ["horizon", "n", "pct_price_down", "pct_price_up", "avg_return", "median_return", "avg_mfe", "avg_mae"] if c in summary.columns]
+    body = ["<table style='border-collapse:collapse;margin-top:8px;font-size:12px'><tr>"]
+    for c in cols:
+        body.append(f"<th style='border:1px solid #ccc;padding:4px 8px;text-align:left'>{c}</th>")
+    body.append("</tr>")
+    for _, row in summary.iterrows():
+        body.append("<tr>")
+        for c in cols:
+            v = row.get(c)
+            if c in ("pct_price_down", "pct_price_up", "avg_return", "median_return", "avg_mfe", "avg_mae") and v == v and v is not None:
+                cell = f"{100*float(v):.1f}%" if c.startswith("pct_") else f"{100*float(v):+.2f}%"
+            elif v != v or v is None:
+                cell = "—"
+            else:
+                cell = str(v)
+            body.append(f"<td style='border:1px solid #ccc;padding:4px 8px'>{cell}</td>")
+        body.append("</tr>")
+    body.append("</table></div>")
+    return head + "".join(body)
 
 
 def _kpi_html(s: dict) -> str:
@@ -183,6 +242,7 @@ def _health_html(h: dict) -> str:
         + badge("OI", h.get("oi"))
         + badge("Funding", h.get("funding"))
         + badge("Liquidation", h.get("liquidation"))
+        + badge("Book", h.get("orderbook"))
         + badge("WS", h.get("ws"))
         + "</div>"
     )
@@ -297,6 +357,7 @@ class Dashboard:
         self.engine = MarketSession()
         self._timer: threading.Timer | None = None
         self._last_chart = 0.0
+        self._last_grok = ""
         self._lock = threading.Lock()
 
         self.symbol = W.Text(value="BTCUSDT", description="SYMBOL", style={"description_width": "70px"})
@@ -317,6 +378,16 @@ class Dashboard:
         self.btn_stop = W.Button(description="STOP", button_style="danger")
         self.btn_grok = W.Button(description="Grok comment", button_style="info")
         self.btn_copy = W.Button(description="Copy snapshot")
+        self.btn_bt = W.Button(description="Backtest", button_style="warning")
+        self.bt_score = W.Dropdown(
+            options=["long_setup", "short_setup", "long_confirm", "short_confirm"],
+            value="long_setup",
+            description="SCORE",
+            style={"description_width": "60px"},
+            layout=W.Layout(width="220px"),
+        )
+        self.bt_min = W.FloatText(value=60.0, description="MIN", style={"description_width": "40px"}, layout=W.Layout(width="140px"))
+        self.bt_out = W.HTML("<i>Backtest uses this session’s snapshots + chart timeframe candles. Descriptive only.</i>")
         self.copy_box = W.Textarea(
             value="",
             placeholder="Click Copy snapshot to fill this box (and the clipboard).",
@@ -349,11 +420,13 @@ class Dashboard:
         self.btn_stop.on_click(self._on_stop)
         self.btn_grok.on_click(self._on_grok)
         self.btn_copy.on_click(self._on_copy)
+        self.btn_bt.on_click(self._on_backtest)
         self.tf.observe(self._on_tf_change, names="value")
 
         controls = W.HBox(
             [self.symbol, self.tf, self.btn_start, self.btn_stop, self.btn_copy, self.btn_grok]
         )
+        bt_row = W.HBox([self.bt_score, self.bt_min, self.btn_bt])
         scores = W.HBox([self.long_box, self.short_box])
         charts = W.VBox(
             [
@@ -376,6 +449,9 @@ class Dashboard:
                 self.health,
                 self.kpis,
                 self.gates_box,
+                W.HTML("<h3>Backtest (this session — no orders)</h3>"),
+                bt_row,
+                self.bt_out,
                 self.copy_box,
                 scores,
                 W.HTML("<h3>Game-theory panel</h3>"),
@@ -432,10 +508,46 @@ class Dashboard:
             self._timer = None
         self.log.value = "Stopped."
 
+    def _on_backtest(self, _=None) -> None:
+        try:
+            import backtest as bt
+
+            col = str(self.bt_score.value)
+            thresh = float(self.bt_min.value)
+            scores, candles = bt.frames_from_session(self.engine)
+            n_scores = 0 if scores is None or scores.empty else len(scores)
+            if n_scores == 0 or col not in (scores.columns if n_scores else []):
+                self.bt_out.value = (
+                    "<i>No score snapshots in this session yet. Click START and wait "
+                    "(scores flush ~every 15s), then Backtest.</i>"
+                )
+                return
+            if candles is None or candles.empty or "open_time" not in candles.columns:
+                self.bt_out.value = "<i>No candles loaded for this timeframe. START first.</i>"
+                return
+            ev, sm = bt.run_report(scores, candles, col, thresh)
+            n_ev = 0 if ev is None or ev.empty else len(ev)
+            self.bt_out.value = _backtest_html(
+                self.engine.symbol,
+                self.engine.timeframe,
+                col,
+                thresh,
+                n_scores,
+                n_ev,
+                sm,
+            )
+            self.log.value = f"<span style='color:green'>Backtest {col} ≥ {thresh:g}: {n_ev} events</span>"
+        except Exception as exc:
+            self.bt_out.value = f"<pre style='color:red'>{exc}\n{traceback.format_exc()}</pre>"
+
     def _on_copy(self, _=None) -> None:
         try:
             snap = self.engine.snapshot()
-            text = format_copy_snapshot(snap, symbol_override=self.symbol.value)
+            text = format_copy_snapshot(
+                snap,
+                symbol_override=self.symbol.value,
+                grok_comment=self._last_grok,
+            )
             self.copy_box.value = text
             msg = _to_clipboard(text)
             self.log.value = f"<span style='color:green'>{msg}</span>"
@@ -457,6 +569,7 @@ class Dashboard:
                     state_reason=snap.get("state_reason") or "",
                 )
                 ans = gi.ask_grok(text)
+                self._last_grok = ans or ""
                 self.grok_out.value = f"<pre style='white-space:pre-wrap'>{ans}</pre>"
             except Exception as exc:
                 self.grok_out.value = f"<pre style='color:red'>{exc}</pre>"
