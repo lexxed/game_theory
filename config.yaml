@@ -1,0 +1,136 @@
+# Game Theory Trading Dashboard — all tunables live here.
+# Restart the session after editing (or call engine.reload_config()).
+
+symbol_default: BTCUSDT
+timeframe_default: "15m"
+timeframes: ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+binance:
+  rest_base: "https://fapi.binance.com"
+  # 2026 USD-M public market path. Legacy /ws and /stream time out.
+  ws_combined: "wss://fstream.binance.com/market/stream"
+  ws_raw: "wss://fstream.binance.com/market/ws"
+  request_timeout_s: 12
+  rest_retries: 3
+  rest_backoff_s: 0.6
+  # REST poll intervals (seconds)
+  oi_poll_s: 3.0
+  premium_poll_s: 5.0
+  ticker_poll_s: 10.0
+  hist_poll_s: 60.0
+  kline_seed_limit: 300
+  funding_hist_limit: 200
+  oi_hist_limit: 100
+  agg_trade_seed: 500
+
+buffers:
+  max_trades: 25000
+  max_liquidations: 3000
+  max_score_rows: 2500
+  max_oi_rows: 4000
+  max_funding_rows: 2000
+  max_cvd_rows: 4000
+  footprint_bars: 48
+
+stale_after_s:
+  price: 8
+  trades: 8
+  oi: 20
+  funding: 20
+  kline: 90
+  # Liquidations are event-driven. No event != stale if the socket is up.
+  liquidation_socket: 15
+
+storage:
+  dir: data
+  duckdb_file: data/market.duckdb
+  parquet_dir: data/parquet
+  flush_every_s: 15
+  retain_days: 14
+
+footprint:
+  # bucket = tick_size * tick_multiplier
+  tick_multiplier: 1
+  # auto-widen buckets if more than max_levels would appear
+  max_levels: 40
+  stacked_imbalance_ratio: 3.0
+  stacked_min_levels: 3
+
+divergence:
+  swing_lookback: 5
+  min_swings: 2
+  # price must make a higher high of at least this % of price
+  min_price_hh_pct: 0.04
+  min_price_ll_pct: 0.04
+  # CVD "fails to confirm" if it does not exceed prior swing by this fraction
+  # of the prior swing's absolute CVD magnitude (0 = any non-HH / non-LL)
+  cvd_confirm_frac: 0.0
+  # require the two swings to be at least this many bars apart
+  min_swing_gap_bars: 3
+
+absorption:
+  lookback_s: 180
+  # |delta| must exceed this fraction of lookback volume
+  min_delta_frac_of_volume: 0.18
+  # price progress (abs) must be below this fraction of recent ATR
+  max_progress_atr: 0.35
+  atr_bars: 14
+  large_imbalance_frac: 0.30
+
+cascade:
+  lookback_s: 180
+  oi_drop_ref_pct: 0.35
+  liq_spike_vs_median: 4.0
+  price_accel_ref_pct: 0.25
+  enter: 70
+  exit: 50
+
+squeeze:
+  oi_drop_pct: 0.08
+  price_move_pct: 0.08
+  cvd_confirm: true
+
+state_machine:
+  min_dwell_s: 25
+  setup_enter: 70
+  setup_exit: 55
+  confirm_enter: 65
+  confirm_exit: 50
+  absorption_enter: 60
+  crowding_enter: 60
+
+# Setup scores (must sum to 100)
+weights_setup:
+  crowding: 15
+  oi_behavior: 15
+  funding: 10
+  cvd_divergence: 20
+  absorption: 20
+  liquidation_risk: 15
+  price_structure: 5
+
+# Confirmation scores (must sum to 100)
+weights_confirm:
+  support_break: 25
+  oi_unwind: 20
+  liquidation_flow: 25
+  cvd_follow: 15
+  acceleration: 15
+
+scoring_refs:
+  funding_high: 0.0005          # +0.05% per interval ≈ crowded
+  oi_expand_pct: 0.40           # 0.40% / 15m is a large OI pop
+  stall_gap_pct: 0.25
+  liq_notional_ref: 250000.0    # USDT, 15m window, scale per symbol later
+  near_extreme_pct: 0.15
+
+grok:
+  enabled: true
+  exe: grok
+  timeout_s: 90
+  max_turns: 1
+
+dashboard:
+  refresh_s: 1.0
+  chart_refresh_s: 2.0
+  footprint_rows: 18

@@ -1,0 +1,135 @@
+"""Deterministic narrative templates. No model, no certainty language."""
+
+
+def interpret(symbol: str, snap: dict, scores: dict, state: str, reason: str) -> str:
+    px = snap.get("price") or 0.0
+    oi = snap.get("oi") or {}
+    fund = snap.get("funding") or 0.0
+    ls = scores["long_setup"]["total"]
+    lc = scores["long_confirm"]["total"]
+    ss = scores["short_setup"]["total"]
+    sc = scores["short_confirm"]["total"]
+    headline = _headline(state, ls, lc, ss, sc)
+
+    facts = []
+    facts.append(f"Price {px:.6g} | 24h {snap.get('change_24h_pct', 0):+.2f}%")
+    facts.append(
+        f"OI {oi.get('oi', 0):,.4g} | Δ1m {oi.get('chg_1m_pct', 0):+.3f}% "
+        f"Δ15m {oi.get('chg_15m_pct', 0):+.3f}% Δ1h {oi.get('chg_1h_pct', 0):+.3f}%"
+    )
+    facts.append(
+        f"Funding {fund:.6f} (pctile {snap.get('funding_pctile', 50):.0f}) — "
+        "a transfer between longs and shorts, not proof of who is positioned."
+    )
+    facts.append(
+        f"CVD {snap.get('cvd', 0):+.4g} | Δ15m {snap.get('cvd_chg_15m', 0):+.4g} | "
+        f"delta 3m {snap.get('delta_3m', 0):+.4g}"
+    )
+    liq = snap.get("liq_15m") or {}
+    facts.append(
+        f"OBSERVED liq 15m: long ${liq.get('long_notional', 0):,.0f} "
+        f"({liq.get('long_n', 0)} ev) / short ${liq.get('short_notional', 0):,.0f} "
+        f"({liq.get('short_n', 0)} ev). Incomplete public force-order sample."
+    )
+    if snap.get("ls_account_ratio") is not None:
+        facts.append(
+            f"Global account long/short ratio {snap['ls_account_ratio']:.3f} "
+            "(Binance advertised account ratio — not open-interest split)."
+        )
+    if snap.get("cvd_div", {}).get("reason"):
+        facts.append("CVD: " + snap["cvd_div"]["reason"])
+    if snap.get("absorption", {}).get("reason"):
+        facts.append("Footprint: " + snap["absorption"]["reason"])
+    if snap.get("structure", {}).get("reason"):
+        facts.append("Structure: " + snap["structure"]["reason"])
+
+    game = _game_block(state, snap, ls, lc, ss, sc)
+
+    lines = [
+        f"SYMBOL {symbol}   STATE: {state}",
+        "",
+        headline,
+        "",
+        "OBSERVED FACTS",
+        *[f"  • {x}" for x in facts],
+        "",
+        "INTERPRETATION (not a forecast)",
+        f"  Long trap setup {ls:.0f}/100  confirm {lc:.0f}/100",
+        f"  Short trap setup {ss:.0f}/100  confirm {sc:.0f}/100",
+        f"  Cascade intensity  long {scores.get('cascade_long', 0):.0f}  short {scores.get('cascade_short', 0):.0f}",
+        f"  State reason: {reason}",
+        "",
+        "CURRENT GAME",
+        game,
+        "",
+        "WHAT WOULD INVALIDATE THIS",
+        _invalidate(state, snap),
+        "",
+        "LIMITS: OI change is not side-identified. Funding is not positioning. "
+        "CVD is aggressive flow, not trader identity. Liquidations are a sampled public stream. "
+        "A high setup score does not mean price must move.",
+    ]
+    return "\n".join(lines)
+
+
+def _headline(state: str, ls, lc, ss, sc) -> str:
+    if "LONG LIQUIDATION CASCADE" in state:
+        return "FORCED FLOW: observed long liquidations + shrinking OI + falling price."
+    if "SHORT LIQUIDATION CASCADE" in state:
+        return "FORCED FLOW: observed short liquidations + shrinking OI + rising price."
+    if state == "LONG SQUEEZE":
+        return "SHORTS LOOK SQUEEZED (price up, OI down, short liqs) — could also be voluntary short covering."
+    if state == "SHORT SQUEEZE":
+        return "LONGS LOOK SQUEEZED (price down, OI down, long liqs) — could also be voluntary long covering."
+    if "LONG TRAP" in state and lc >= 65:
+        return "LONGS ARE CURRENTLY VULNERABLE — and adverse flow is showing up."
+    if "LONG TRAP" in state:
+        return "LONGS APPEAR VULNERABLE — setup only; trap is NOT confirmed."
+    if "SHORT TRAP" in state and sc >= 65:
+        return "SHORTS ARE CURRENTLY VULNERABLE — and adverse flow is showing up."
+    if "SHORT TRAP" in state:
+        return "SHORTS APPEAR VULNERABLE — setup only; trap is NOT confirmed."
+    if "BUY ABSORPTION" in state:
+        return "AGGRESSIVE BUYING IS NOT MOVING PRICE MUCH — possible seller absorption."
+    if "SELL ABSORPTION" in state:
+        return "AGGRESSIVE SELLING IS NOT MOVING PRICE MUCH — possible buyer absorption."
+    if "FAILED BREAKOUT" in state:
+        return "BREAKOUT FAILED — range high was traded and rejected."
+    if "FAILED BREAKDOWN" in state:
+        return "BREAKDOWN FAILED — range low was traded and rejected."
+    if "LONG ACCUMULATION" in state:
+        return "ESTIMATED LONG-SIDE CROWDING — not proof of who holds OI."
+    if "SHORT ACCUMULATION" in state:
+        return "ESTIMATED SHORT-SIDE CROWDING — not proof of who holds OI."
+    return "NO SIDE IS CLEARLY FORCED. Neutral / mixed evidence."
+
+
+def _game_block(state: str, snap: dict, ls, lc, ss, sc) -> str:
+    support = (snap.get("structure") or {}).get("swing_low")
+    resist = (snap.get("structure") or {}).get("swing_high")
+    return (
+        f"  Longs: need price to hold above local support {support}.\n"
+        f"  Shorts: benefit if support breaks; harmed if resistance {resist} is reclaimed.\n"
+        "  Exchange: liquidates under-margined accounts under published risk rules; "
+        "it earns fees and manages insurance-fund risk. That is incentive, not evidence of manipulation.\n"
+        "  Potential feedback: trigger → forced close/liquidation → same-direction flow → "
+        "further trigger — until the book is exhausted and a new equilibrium forms.\n"
+        f"  Setup vs confirmation: long {ls:.0f}/{lc:.0f}   short {ss:.0f}/{sc:.0f} "
+        "(high setup + low confirm = vulnerable but not yet forced)."
+    )
+
+
+def _invalidate(state: str, snap: dict) -> str:
+    if "LONG TRAP" in state or "LONG LIQUIDATION" in state or state == "SHORT SQUEEZE":
+        return (
+            "  • Price reclaims and holds above the local high / last failed-breakout level.\n"
+            "  • OI starts expanding again with a clean CVD higher-high.\n"
+            "  • Observed long-liquidation flow dries up and funding mean-reverts without a break."
+        )
+    if "SHORT TRAP" in state or "SHORT LIQUIDATION" in state or state == "LONG SQUEEZE":
+        return (
+            "  • Price loses the reclaimed level and makes a clean lower low with CVD confirmation.\n"
+            "  • OI expands into the decline again.\n"
+            "  • Observed short-liquidation flow dries up."
+        )
+    return "  • A one-sided combination of OI + CVD + observed liquidations + structure break."

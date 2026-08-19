@@ -1,0 +1,13 @@
+numpy>=1.26
+pandas>=2.1
+requests>=2.31
+websockets>=12.0
+pyyaml>=6.0
+plotly>=5.20
+anywidget>=0.9
+ipywidgets>=8.1
+jupyterlab>=4.0
+jupyterlab_widgets>=3.0
+duckdb>=1.0
+pyarrow>=14.0
+nest_asyncio>=1.6
