@@ -429,9 +429,11 @@ class MarketSession:
         atr = self.structure.atr(tf, int(get("absorption.atr_bars", 14)))
         absorption = self.foot.detect_absorption(tf, progress, atr, get("absorption", {}))
         cvd_div = self.cvd.detect_divergence(tf, get("divergence", {}))
-        structure = self.structure.analyze(
-            tf, int(get("divergence.swing_lookback", 5)), float(get("scoring_refs.near_extreme_pct", 0.15))
-        )
+        look = int(get("divergence.swing_lookback", 5))
+        near = float(get("scoring_refs.near_extreme_pct", 0.15))
+        structure = self.structure.analyze(tf, look, near)
+        structure_5m = self.structure.analyze("5m", look, near)
+        structure_1m = self.structure.analyze("1m", look, near)
         oi_s = self.oi.snapshot()
         fund_s = self.funding.snapshot()
         ob_s = self.orderbook.imbalance(
@@ -445,14 +447,18 @@ class MarketSession:
             "change_24h_pct": (self.ticker or {}).get("change_pct", 0.0),
             "oi": oi_s,
             "oi_chg_15m_pct": oi_s["chg_15m_pct"],
+            "oi_chg_5m_pct": oi_s["chg_5m_pct"],
             "price_chg_1m_pct": self.structure.change_pct("1m", 1),
             "price_chg_5m_pct": self.structure.change_pct("5m", 1),
             "price_chg_15m_pct": self.structure.change_pct("15m", 1),
+            "recent_local_high": self.structure.recent_high("5m", 20),
             "funding": fund_s["funding"],
             "funding_pctile": fund_s["funding_pctile"],
             "ls_account_ratio": self.ls_account_ratio,
             "top_pos_ratio": self.top_pos_ratio,
             "cvd": self.cvd.last_for(tf),
+            "cvd_chg_1m": self.cvd.change_from_series(tf, 60_000),
+            "cvd_chg_3m": self.cvd.change_from_series(tf, 180_000),
             "cvd_chg_5m": self.cvd.change_from_series(tf, 5 * 60_000),
             "cvd_chg_15m": self.cvd.change_from_series(tf, 15 * 60_000),
             "cvd_div": cvd_div,
@@ -463,6 +469,8 @@ class MarketSession:
             "liq_baseline": self.liqs.baseline(15 * 60_000, 4 * 60 * 60_000),
             "oi_value": float(oi_s.get("oi_value") or 0.0),
             "structure": structure,
+            "structure_5m": structure_5m,
+            "structure_1m": structure_1m,
             "orderbook": ob_s,
             "taker_ratio_1m": taker_1m,
             "taker_ratio_5m": taker_5m,

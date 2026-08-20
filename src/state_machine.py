@@ -28,6 +28,8 @@ STATES = [
     "SHORT-SIDE CROWDING ESTIMATE",
     "POTENTIAL LONG TRAP",
     "POTENTIAL SHORT TRAP",
+    "LONG TRAP DEVELOPING",
+    "LONG TRAP DEVELOPING STRONG",
     "BUY ABSORPTION",
     "SELL ABSORPTION",
     "BREAKOUT",
@@ -128,10 +130,15 @@ class StateMachine:
             return "LONG FORCED FLOW", gates.get("trade_status_reason") or "long forced-flow gate"
 
         # Confirm score is NOT used as a trap-confirmed signal.
-        if gates.get("long_trap_confirmation") and ls >= setup_x:
+        if gates.get("long_trap_confirmation"):
             return "POTENTIAL LONG TRAP", "structure+flow GATE met (confirm score ignored)"
-        if gates.get("short_trap_confirmation") and ss >= setup_x:
+        if gates.get("short_trap_confirmation"):
             return "POTENTIAL SHORT TRAP", "structure+flow GATE met (confirm score ignored)"
+
+        if gates.get("long_trap_developing_strong"):
+            return "LONG TRAP DEVELOPING STRONG", gates.get("long_trap_developing_reason") or "early warning — not confirmation"
+        if gates.get("long_trap_developing"):
+            return "LONG TRAP DEVELOPING", gates.get("long_trap_developing_reason") or "early warning — not confirmation"
 
         if st.get("failed_breakout") and ls >= setup_x:
             return "FAILED BREAKOUT", "range high taken out then rejected"
@@ -181,6 +188,8 @@ def _priority(state: str) -> int:
         "CASCADE EXHAUSTION": 70,
         "POTENTIAL LONG TRAP": 60,
         "POTENTIAL SHORT TRAP": 60,
+        "LONG TRAP DEVELOPING STRONG": 58,
+        "LONG TRAP DEVELOPING": 56,
         "FAILED BREAKOUT": 50,
         "FAILED BREAKDOWN": 50,
         "BREAKOUT": 45,

@@ -106,6 +106,16 @@ gates:
   cascade_min_observed_notional: 100000
   cascade_min_liq_to_oi: 0.001       # 0.10% of OI USDT
 
+# Early-warning layer between LONG TRAP SETUP and LONG TRAP CONFIRMING.
+# Does not replace the confirmation gate or the trade gate.
+developing:
+  early_price_reversal_pct: 0.20
+  strong_early_price_reversal_pct: 0.40
+  early_oi_unwind_5m_pct: -0.50
+  threshold: 35.0
+  strong_threshold: 50.0
+  long_crowding_early_threshold: 50.0
+
 squeeze:
   oi_drop_pct: 0.08
   price_move_pct: 0.08

@@ -19,10 +19,13 @@ from __future__ import annotations
 
 from config import get
 from src.liquidations import classify_liquidation, oi_usdt
+from src.scoring import long_trap_developing as compute_long_trap_developing
 
 TRADE_STATUSES = (
     "WAIT",
     "WATCH LONG-TRAP",
+    "LONG TRAP DEVELOPING",
+    "LONG TRAP DEVELOPING STRONG",
     "LONG-TRAP CONFIRMING",
     "LONG FORCED-FLOW",
     "LONG SQUEEZE",
@@ -262,6 +265,13 @@ def evaluate(snap: dict, scores: dict) -> dict:
     short_squeeze = bool(sq.get("short_squeeze")) and short_forced
     long_squeeze = bool(sq.get("long_squeeze")) and long_forced
 
+    # Early warning. Does not change confirmation, forced-flow, cascade, or entry.
+    dev = scores.get("long_trap_developing")
+    if not isinstance(dev, dict):
+        dev = compute_long_trap_developing(snap)
+    long_developing = bool(dev.get("developing"))
+    long_developing_strong = bool(dev.get("developing_strong"))
+
     trade_status, trade_reason = _trade_status(
         long_cascade=long_cascade,
         short_cascade=short_cascade,
@@ -271,11 +281,14 @@ def evaluate(snap: dict, scores: dict) -> dict:
         short_forced=short_forced,
         long_confirmed=long_confirmed,
         short_confirmed=short_confirmed,
+        long_developing_strong=long_developing_strong,
+        long_developing=long_developing,
         long_vuln=long_vuln,
         short_vuln=short_vuln,
         watch=watch,
         long_liq_event=long_liq_event,
         short_liq_event=short_liq_event,
+        developing_reason=str(dev.get("reason") or ""),
     )
 
     explanations = {
@@ -372,6 +385,16 @@ def evaluate(snap: dict, scores: dict) -> dict:
             _line(long_liq_event, "LONG LIQ EVENT", explanations["long_liq_event"]["triggered_by"], explanations["long_liq_event"]["failed"]),
             _line(long_forced, "LONG FORCED FLOW", long_ff_trig, long_ff_fail),
             _line(long_confirmed, "LONG TRAP CONFIRM", explanations["long_trap_confirmation"]["triggered_by"], explanations["long_trap_confirmation"]["failed"]),
+            (
+                f"LONG TRAP DEVELOPING: {'YES' if long_developing else 'NO'}  "
+                f"SCORE {float(dev.get('score') or 0):.1f}/100  "
+                f"STRONG: {'YES' if long_developing_strong else 'NO'}  "
+                f"EARLY SIGNALS price={bool(dev.get('early_price_reversal'))} "
+                f"cvd={bool(dev.get('early_cvd_reversal'))} "
+                f"oi_unwind={bool(dev.get('early_oi_unwind'))} "
+                f"short_term_support_break={bool(dev.get('early_support_break'))} "
+                f"evidence={int(dev.get('evidence_count') or 0)}/4"
+            ),
             _line(long_squeeze, "LONG SQUEEZE", explanations["long_squeeze"]["triggered_by"], explanations["long_squeeze"]["failed"]),
             _line(short_cascade, "SHORT CASCADE (actual)", short_cas_trig, short_cas_fail),
             _line(long_cascade, "LONG CASCADE (actual)", long_cas_trig, long_cas_fail),
@@ -387,6 +410,11 @@ def evaluate(snap: dict, scores: dict) -> dict:
         "short_vulnerability": round(short_vuln, 2),
         "long_trap_confirmation": long_confirmed,
         "short_trap_confirmation": short_confirmed,
+        "long_trap_developing": long_developing,
+        "long_trap_developing_strong": long_developing_strong,
+        "long_trap_developing_score": float(dev.get("score") or 0.0),
+        "long_trap_developing_reason": dev.get("reason") or "",
+        "long_trap_developing_detail": dev,
         "long_trap_confirmation_score": float((scores.get("long_confirm") or {}).get("total") or 0.0),
         "short_trap_confirmation_score": float((scores.get("short_confirm") or {}).get("total") or 0.0),
         "long_structure_gate": long_struct,
@@ -439,6 +467,9 @@ def _trade_status(
     watch: float,
     long_liq_event: bool,
     short_liq_event: bool,
+    long_developing_strong: bool = False,
+    long_developing: bool = False,
+    developing_reason: str = "",
 ) -> tuple[str, str]:
     if long_cascade or short_cascade:
         side = "long" if long_cascade else "short"
@@ -467,6 +498,12 @@ def _trade_status(
         if long_vuln >= short_vuln:
             return "LONG-TRAP CONFIRMING", "both confirm gates — using higher long vulnerability"
         return "SHORT-TRAP CONFIRMING", "both confirm gates — using higher short vulnerability"
+    # After confirm, before WATCH SETUP. Does not outrank cascade/squeeze/forced-flow.
+    # Not a trade entry.
+    if long_developing_strong:
+        return "LONG TRAP DEVELOPING STRONG", developing_reason or "early warning — not confirmation"
+    if long_developing:
+        return "LONG TRAP DEVELOPING", developing_reason or "early warning — not confirmation"
     if long_vuln >= watch and long_vuln >= short_vuln:
         return "WATCH LONG-TRAP", f"long setup {long_vuln:.0f} ≥ watch {watch:.0f} — vulnerability only"
     if short_vuln >= watch:

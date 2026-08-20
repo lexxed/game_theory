@@ -127,6 +127,116 @@ def crowding_breakdown(snap: dict) -> dict:
     }
 
 
+def _neg(val) -> bool:
+    return val is not None and float(val) < 0.0
+
+
+def long_trap_developing(snap: dict) -> dict:
+    """
+    Early-warning layer. Not confirmation. Uses only fields already on the snap
+    (no future candles). OI down is 'book shrinking', not 'longs closed'.
+    """
+    cfg = get("developing", {})
+    early_px_th = float(cfg.get("early_price_reversal_pct", 0.20))
+    strong_px_th = float(cfg.get("strong_early_price_reversal_pct", 0.40))
+    oi_th = float(cfg.get("early_oi_unwind_5m_pct", -0.50))
+    score_th = float(cfg.get("threshold", 35.0))
+    strong_th = float(cfg.get("strong_threshold", 50.0))
+    crowd_th = float(cfg.get("long_crowding_early_threshold", 50.0))
+
+    crowd = crowding_breakdown(snap)
+    long_crowding = float(crowd["long_100"])
+    crowding_component = min(max(long_crowding, 0.0), 100.0) * 0.20
+
+    price = float(snap.get("price") or 0.0)
+    high = float(snap.get("recent_local_high") or 0.0)
+    if high <= 0:
+        st5 = snap.get("structure_5m") or {}
+        high = float(st5.get("swing_high") or 0.0)
+    if high <= 0:
+        st = snap.get("structure") or {}
+        high = float(st.get("swing_high") or 0.0)
+    drawdown = ((high - price) / high * 100.0) if high > 0 and price > 0 else 0.0
+    early_price_reversal = drawdown >= early_px_th
+    strong_early_price_reversal = drawdown >= strong_px_th
+
+    cvd1 = snap.get("cvd_chg_1m")
+    cvd3 = snap.get("cvd_chg_3m")
+    cvd5 = snap.get("cvd_chg_5m")
+    if cvd1 is not None and cvd3 is not None:
+        early_cvd_reversal = _neg(cvd1) and _neg(cvd3)
+    elif cvd1 is not None:
+        early_cvd_reversal = _neg(cvd1) and _neg(cvd5)
+    else:
+        early_cvd_reversal = _neg(cvd5) and _neg(snap.get("delta_3m"))
+
+    oi_blob = snap.get("oi") or {}
+    oi5 = snap.get("oi_chg_5m_pct")
+    if oi5 is None:
+        oi5 = oi_blob.get("chg_5m_pct")
+    oi5 = float(oi5 or 0.0)
+    px5 = float(snap.get("price_chg_5m_pct") or 0.0)
+    early_oi_unwind = oi5 <= oi_th and px5 < 0.0
+
+    st5 = snap.get("structure_5m") or {}
+    st1 = snap.get("structure_1m") or {}
+    early_support_break = bool(st5.get("lost_support") or st1.get("lost_support"))
+
+    price_component = 20.0 if early_price_reversal else 0.0
+    cvd_component = 20.0 if early_cvd_reversal else 0.0
+    oi_component = 20.0 if early_oi_unwind else 0.0
+    structure_component = 20.0 if early_support_break else 0.0
+    score = round(
+        crowding_component + price_component + cvd_component + oi_component + structure_component,
+        2,
+    )
+    evidence = [
+        ("price_reversal", early_price_reversal),
+        ("cvd_reversal", early_cvd_reversal),
+        ("oi_unwind", early_oi_unwind),
+        ("short_term_support_break", early_support_break),
+    ]
+    evidence_count = sum(1 for _, hit in evidence if hit)
+    crowding_ok = long_crowding >= crowd_th
+    developing = bool(crowding_ok and score >= score_th and evidence_count >= 2)
+    developing_strong = bool(crowding_ok and score >= strong_th and evidence_count >= 3)
+
+    bits = []
+    if crowding_ok:
+        bits.append("crowded long-side proxy")
+    if early_price_reversal:
+        bits.append("short-term price reversal")
+    if early_cvd_reversal:
+        bits.append("negative CVD")
+    if early_oi_unwind:
+        bits.append("OI shrinking while price declines")
+    if early_support_break:
+        bits.append("short-term support lost")
+    reason = " + ".join(bits) if bits else "no early long-trap evidence"
+
+    return {
+        "score": score,
+        "long_crowding": round(long_crowding, 2),
+        "drawdown_from_recent_high_pct": round(drawdown, 4),
+        "recent_local_high": high,
+        "early_price_reversal": early_price_reversal,
+        "strong_early_price_reversal": strong_early_price_reversal,
+        "early_cvd_reversal": early_cvd_reversal,
+        "early_oi_unwind": early_oi_unwind,
+        "early_support_break": early_support_break,
+        "evidence_count": evidence_count,
+        "crowding_component": round(crowding_component, 2),
+        "price_component": price_component,
+        "cvd_component": cvd_component,
+        "oi_component": oi_component,
+        "structure_component": structure_component,
+        "developing": developing,
+        "developing_strong": developing_strong,
+        "reason": reason,
+        "note": "Early warning only. Not LONG TRAP CONFIRM. Not a trade entry. OI is not side-identified.",
+    }
+
+
 class ScoreEngine:
     def __init__(self):
         pass
@@ -138,6 +248,7 @@ class ScoreEngine:
         short_conf = self._confirm(snap, side="short")
         cascade = self._cascade(snap)
         squeeze = self._squeeze(snap)
+        developing = long_trap_developing(snap)
         return {
             "long_setup": long_setup.as_dict(),
             "short_setup": short_setup.as_dict(),
@@ -149,6 +260,7 @@ class ScoreEngine:
             "cascade_short_intensity": cascade["short"],
             "cascade_note": cascade.get("note", ""),
             "squeeze": squeeze,
+            "long_trap_developing": developing,
         }
 
     def _setup(self, s: dict, side: str) -> ScoreCard:

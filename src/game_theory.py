@@ -85,6 +85,10 @@ def _headline(state: str, ls, lc, ss, sc) -> str:
         return "LONG FORCED FLOW: meaningful long liquidations with falling price, falling CVD, and declining OI. Not a trap by itself."
     if state == "SHORT FORCED FLOW":
         return "SHORT FORCED FLOW: meaningful short liquidations with rising price, rising CVD, and declining OI. Not a trap by itself."
+    if state == "LONG TRAP DEVELOPING STRONG":
+        return "LONG TRAP DEVELOPING STRONG — early warning (crowding + several short-term reversals). NOT confirmation."
+    if state == "LONG TRAP DEVELOPING":
+        return "LONG TRAP DEVELOPING — early warning. NOT confirmation. Existing confirm gate unchanged."
     if "LONG TRAP" in state:
         return "LONG-SIDE VULNERABILITY (setup). Confirmed only if structure+flow GATE is true — not via confirm score."
     if "SHORT TRAP" in state:

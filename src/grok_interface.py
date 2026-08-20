@@ -39,6 +39,8 @@ re-score, do not place trades, do not claim certainty.
 - LONG FORCED FLOW requires meaningful long liq AND falling price AND falling CVD AND declining OI.
 - Cascade STATE requires the cascade GATE (intensity + meaningful same-side liq + direction). Intensity (CASCADE_LONG/SHORT) is price/OI/CVD only and is NOT a cascade by itself.
 - Funding percentile and account LS ratio are CROWDING PROXIES, not long/short OI.
+- LONG TRAP DEVELOPING is an early warning only. It is NOT confirmation and NOT a trade entry.
+  Confirm remains LONG_TRAP_CONFIRMATION_GATE. Do not upgrade DEVELOPING to CONFIRMING.
 
 ## Allowed STATE values (exact strings)
 - NEUTRAL
@@ -46,6 +48,8 @@ re-score, do not place trades, do not claim certainty.
 - SHORT-SIDE CROWDING ESTIMATE
 - POTENTIAL LONG TRAP
 - POTENTIAL SHORT TRAP
+- LONG TRAP DEVELOPING
+- LONG TRAP DEVELOPING STRONG
 - BUY ABSORPTION
 - SELL ABSORPTION
 - FAILED BREAKOUT
@@ -249,6 +253,12 @@ def compact_snapshot(
         "LONG_TRAP_SETUP_SCORE": scores["long_setup"]["total"],
         "LONG_TRAP_CONFIRM_SCORE_DIAGNOSTIC_ONLY": scores["long_confirm"]["total"],
         "LONG_TRAP_CONFIRMATION_GATE": (scores.get("gates") or {}).get("long_trap_confirmation", False),
+        "LONG_TRAP_DEVELOPING": (scores.get("gates") or {}).get("long_trap_developing", False),
+        "LONG_TRAP_DEVELOPING_STRONG": (scores.get("gates") or {}).get("long_trap_developing_strong", False),
+        "LONG_TRAP_DEVELOPING_SCORE": (scores.get("gates") or {}).get("long_trap_developing_score", 0),
+        "LONG_TRAP_DEVELOPING_DETAIL": (scores.get("gates") or {}).get("long_trap_developing_detail")
+        or scores.get("long_trap_developing")
+        or {},
         "SHORT_TRAP_SETUP_SCORE": scores["short_setup"]["total"],
         "SHORT_TRAP_CONFIRM_SCORE_DIAGNOSTIC_ONLY": scores["short_confirm"]["total"],
         "SHORT_TRAP_CONFIRMATION_GATE": (scores.get("gates") or {}).get("short_trap_confirmation", False),

@@ -68,6 +68,13 @@ class PriceStructure:
             return 0.0
         return pct_change(bars[-1]["close"], bars[0]["open"])
 
+    def recent_high(self, tf: str, n: int = 20) -> float:
+        """Highest high among the last n bars already in memory (no future candles)."""
+        bars = self.last_n(tf, n)
+        if not bars:
+            return 0.0
+        return max(float(b.get("high") or 0.0) for b in bars)
+
     def analyze(self, tf: str, lookback: int = 5, near_pct: float = 0.15) -> dict:
         bars = self.last_n(tf, 120)
         empty = {

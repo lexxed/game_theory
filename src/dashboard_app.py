@@ -55,6 +55,8 @@ def format_copy_snapshot(snap: dict, symbol_override: str = "", grok_comment: st
         return lines
 
     symbol = (symbol_override or snap.get("symbol") or "").strip().upper()
+    g = sc.get("gates") or {}
+    dev = g.get("long_trap_developing_detail") or {}
     lines = [
         f"SNAPSHOT  {symbol}  {snap.get('timeframe')}  {now}",
         f"SYMBOL  {symbol}   TF  {snap.get('timeframe')}",
@@ -77,12 +79,21 @@ def format_copy_snapshot(snap: dict, symbol_override: str = "", grok_comment: st
         *card_lines("SHORT TRAP SETUP", sc.get("short_setup") or {}),
         *card_lines("SHORT TRAP CONFIRM", sc.get("short_confirm") or {}),
         "",
-        f"TRADE STATUS        {(snap.get('trade_status') or (sc.get('gates') or {}).get('trade_status'))}",
-        f"TRADE REASON        {(sc.get('gates') or {}).get('trade_status_reason')}",
-        f"LONG LIQ EVENT      {(sc.get('gates') or {}).get('long_liq_event')}  level={(sc.get('gates') or {}).get('long_liq_level')}",
-        f"LONG FORCED FLOW    {(sc.get('gates') or {}).get('long_forced_flow')}",
-        f"LONG TRAP SETUP     {(sc.get('gates') or {}).get('long_vulnerability')}  CONFIRM={(sc.get('gates') or {}).get('long_trap_confirmation')}",
-        f"LONG SQUEEZE        {(sc.get('gates') or {}).get('long_squeeze')}",
+        f"TRADE STATUS        {(snap.get('trade_status') or g.get('trade_status'))}",
+        f"TRADE REASON        {g.get('trade_status_reason')}",
+        f"LONG LIQ EVENT      {g.get('long_liq_event')}  level={g.get('long_liq_level')}",
+        f"LONG FORCED FLOW    {g.get('long_forced_flow')}",
+        f"LONG TRAP SETUP     {g.get('long_vulnerability')}  CONFIRM={g.get('long_trap_confirmation')}",
+        f"LONG TRAP DEVELOPING: {'YES' if g.get('long_trap_developing') else 'NO'}",
+        f"LONG TRAP DEVELOPING SCORE: {float(g.get('long_trap_developing_score') or 0):.1f}/100",
+        f"LONG TRAP DEVELOPING STRONG: {'YES' if g.get('long_trap_developing_strong') else 'NO'}",
+        "EARLY SIGNALS",
+        f"  price_reversal: {'YES' if dev.get('early_price_reversal') else 'NO'}",
+        f"  cvd_reversal: {'YES' if dev.get('early_cvd_reversal') else 'NO'}",
+        f"  oi_unwind: {'YES' if dev.get('early_oi_unwind') else 'NO'}",
+        f"  short_term_support_break: {'YES' if dev.get('early_support_break') else 'NO'}",
+        f"  evidence_count: {int(dev.get('evidence_count') or 0)}/4",
+        f"LONG SQUEEZE        {g.get('long_squeeze')}",
         f"SHORT LIQ EVENT     {(sc.get('gates') or {}).get('short_liq_event')}  level={(sc.get('gates') or {}).get('short_liq_level')}",
         f"SHORT FORCED FLOW   {(sc.get('gates') or {}).get('short_forced_flow')}",
         f"SHORT TRAP SETUP    {(sc.get('gates') or {}).get('short_vulnerability')}  CONFIRM={(sc.get('gates') or {}).get('short_trap_confirmation')}",
@@ -138,6 +149,9 @@ def _gates_html(s: dict) -> str:
         {_card("LONG LIQ EVENT", _yn(bool(g.get("long_liq_event"))))}
         {_card("LONG FORCED FLOW", _yn(bool(g.get("long_forced_flow"))))}
         {_card("LONG TRAP SETUP", f"{g.get('long_vulnerability', 0):.0f}/100")}
+        {_card("LONG TRAP DEVELOPING", _yn(bool(g.get("long_trap_developing"))))}
+        {_card("LONG TRAP DEVELOPING SCORE", f"{float(g.get('long_trap_developing_score') or 0):.0f}/100")}
+        {_card("LONG TRAP DEVELOPING STRONG", _yn(bool(g.get("long_trap_developing_strong"))))}
         {_card("LONG TRAP CONFIRM", _yn(bool(g.get("long_trap_confirmation"))))}
         {_card("LONG SQUEEZE", _yn(bool(g.get("long_squeeze"))))}
         {_card("SHORT LIQ EVENT", _yn(bool(g.get("short_liq_event"))))}
