@@ -290,17 +290,41 @@ def _score_html(title: str, setup: dict, confirm: dict, state: str) -> str:
     """
 
 
-def _fp_html(rows: list[dict], n: int = 18) -> str:
+def _fp_html(
+    rows: list[dict],
+    n: int = 18,
+    *,
+    tick_size: float | None = None,
+    bucket: float | None = None,
+    tick_mult: int | None = None,
+    tick_raw: str | None = None,
+) -> str:
+    from src.utils import format_price_level
+
+    row0 = rows[0] if rows else {}
+    step = float(bucket or row0.get("bucket") or tick_size or row0.get("tick_size") or 0.0)
+    ts = float(tick_size or row0.get("tick_size") or step or 0.0)
+    mult = int(tick_mult or 1)
+    tick_s = format_price_level(ts, ts, tick_raw) if ts else "n/a"
+    bucket_s = format_price_level(step, step, tick_raw) if step else "n/a"
+    tick_line = (
+        f"<span style='color:#555;font-size:11px'>tickSize={tick_s} × multiplier={mult} "
+        f"→ bucket={bucket_s}</span>"
+    )
     if not rows:
-        return "<i>No footprint yet — waiting for trades on this candle.</i>"
+        return (
+            "<i>No footprint yet — waiting for trades on this candle.</i><br>"
+            + tick_line
+        )
     cell = "border:1px solid #ddd;padding:3px 8px;white-space:nowrap"
     body = []
     for r in rows[:n]:
         d = float(r.get("delta") or 0.0)
         col = "#0a0" if d > 0 else "#c00" if d < 0 else "#444"
+        px = format_price_level(float(r.get("price") or 0.0), step or ts, tick_raw)
         body.append(
             "<tr>"
-            f"<td style='{cell}'>{float(r.get('price') or 0):.4f}</td>"
+            f"<td style='{cell}'>{px}</td>"
             f"<td style='{cell};text-align:right'>{float(r.get('bid') or 0):,.4f}</td>"
             f"<td style='{cell};text-align:right'>{float(r.get('ask') or 0):,.4f}</td>"
             f"<td style='{cell};text-align:right;color:{col}'>{d:+,.4f}</td>"
@@ -310,6 +334,7 @@ def _fp_html(rows: list[dict], n: int = 18) -> str:
     return (
         "<div style='font-family:Consolas,monospace;font-size:12px'>"
         "<b>FOOTPRINT</b> (ask = aggressive buy volume, bid = aggressive sell volume)<br>"
+        f"{tick_line}<br>"
         f"<table style='border-collapse:collapse;margin-top:4px'>"
         f"<tr><th {th}>PRICE</th><th {th}>BID</th><th {th}>ASK</th><th {th}>DELTA</th></tr>"
         + "".join(body)
@@ -622,7 +647,15 @@ class Dashboard:
         self.short_box.value = _score_html("SHORT TRAP", sc.get("short_setup") or {}, sc.get("short_confirm") or {}, st)
         nar = (snap.get("narrative") or "").replace("\n", "<br>")
         self.game.value = f"<div style='font-family:Segoe UI,system-ui,sans-serif;font-size:13px;line-height:1.35'>{nar}</div>"
-        self.fp.value = _fp_html(snap.get("footprint") or [])
+        fm = snap.get("footprint_meta") or {}
+        meta = snap.get("meta") or {}
+        self.fp.value = _fp_html(
+            snap.get("footprint") or [],
+            tick_size=float(fm.get("tick_size") or meta.get("tickSize") or 0.0),
+            bucket=float(fm.get("bucket") or 0.0),
+            tick_mult=int(fm.get("tick_multiplier") or 1),
+            tick_raw=meta.get("tickSize_raw"),
+        )
         now = time.time()
         if now - self._last_chart >= 2.0:
             self._update_charts(snap)

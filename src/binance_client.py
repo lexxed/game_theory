@@ -15,6 +15,16 @@ class BinanceRESTError(RuntimeError):
     pass
 
 
+def select_exchange_symbol(info: dict, symbol: str) -> dict:
+    """Pick the requested contract from exchangeInfo. Never use symbols[0]."""
+    want = str(symbol or "").upper().strip()
+    symbols = info.get("symbols") or []
+    for s in symbols:
+        if str(s.get("symbol") or "").upper() == want:
+            return s
+    raise BinanceRESTError(f"Unknown symbol {symbol}")
+
+
 class BinanceClient:
     def __init__(self):
         self.base = get("binance.rest_base", "https://fapi.binance.com")
@@ -50,18 +60,18 @@ class BinanceClient:
         return True
 
     def exchange_symbol(self, symbol: str) -> dict:
-        info = self._get("/fapi/v1/exchangeInfo", {"symbol": symbol.upper()})
-        symbols = info.get("symbols") or []
-        if not symbols:
-            raise BinanceRESTError(f"Unknown symbol {symbol}")
-        return symbols[0]
+        want = symbol.upper().strip()
+        info = self._get("/fapi/v1/exchangeInfo", {"symbol": want})
+        return select_exchange_symbol(info, want)
 
     def describe_symbol(self, symbol: str) -> dict:
         s = self.exchange_symbol(symbol)
         tick = 0.01
+        tick_raw = "0.01"
         for f in s.get("filters", []):
             if f.get("filterType") == "PRICE_FILTER":
-                tick = safe_float(f.get("tickSize"), 0.01)
+                tick_raw = str(f.get("tickSize") or "0.01").strip()
+                tick = safe_float(tick_raw, 0.01)
         if s.get("status") != "TRADING":
             raise BinanceRESTError(f"{symbol} status is {s.get('status')}, not TRADING")
         if s.get("contractType") not in (None, "PERPETUAL"):
@@ -75,6 +85,7 @@ class BinanceClient:
             "pricePrecision": s.get("pricePrecision"),
             "quantityPrecision": s.get("quantityPrecision"),
             "tickSize": tick,
+            "tickSize_raw": tick_raw,
             "marginAsset": s.get("marginAsset"),
             "quoteAsset": s.get("quoteAsset"),
         }

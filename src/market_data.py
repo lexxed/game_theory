@@ -640,6 +640,7 @@ class MarketSession:
                 "liq_events": self.liqs.window(60 * 60_000),
                 "footprint": fp,
                 "footprint_stacks": stacks,
+                "footprint_meta": self.foot.meta(),
                 "health": self._health(),
                 "narrative": self._narrative,
                 "error": self.last_error,

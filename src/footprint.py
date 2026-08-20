@@ -19,17 +19,26 @@ class FootprintEngine:
         }
 
     def reset(self, tick_size: float | None = None) -> None:
-        if tick_size:
-            self.tick_size = max(tick_size, 1e-12)
-            self.bucket = self.tick_size * self.tick_mult
+        # Keep the active symbol tick unless a new one is supplied.
+        # Do not silently fall back to the constructor default 0.01.
+        if tick_size is not None and float(tick_size) > 0:
+            self.tick_size = max(float(tick_size), 1e-12)
+        self.bucket = self.tick_size * self.tick_mult
         for k in self.books:
             self.books[k] = {}
 
     def set_tick(self, tick_size: float, tick_mult: int | None = None) -> None:
-        self.tick_size = max(tick_size, 1e-12)
+        self.tick_size = max(float(tick_size), 1e-12)
         if tick_mult is not None:
             self.tick_mult = max(int(tick_mult), 1)
         self.bucket = self.tick_size * self.tick_mult
+
+    def meta(self) -> dict:
+        return {
+            "tick_size": self.tick_size,
+            "tick_multiplier": self.tick_mult,
+            "bucket": self.bucket,
+        }
 
     def on_trade(self, trade: dict) -> None:
         px = bucket_price(trade["price"], self.bucket)
@@ -63,6 +72,8 @@ class FootprintEngine:
                     "delta": ask - bid,
                     "total": bid + ask,
                     "bar_open": ot,
+                    "bucket": self.bucket,
+                    "tick_size": self.tick_size,
                 }
             )
         rows.sort(key=lambda r: r["price"], reverse=True)

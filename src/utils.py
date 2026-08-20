@@ -138,6 +138,52 @@ def bucket_price(price: float, tick: float) -> float:
     return round(round(price / tick) * tick, 12)
 
 
+def tick_display_decimals(tick: float, tick_raw: str | None = None) -> int:
+    """Decimal places needed to show adjacent buckets as different strings."""
+    from decimal import Decimal
+
+    src = None
+    if tick_raw not in (None, ""):
+        src = str(tick_raw).strip()
+    elif tick is not None and float(tick) > 0:
+        src = str(tick)
+    if not src:
+        return 4
+    try:
+        d = Decimal(src).normalize()
+    except Exception:
+        return 4
+    exp = d.as_tuple().exponent
+    if not isinstance(exp, int) or exp >= 0:
+        return 0
+    return min(12, -exp)
+
+
+def format_price_level(price: float, tick: float, tick_raw: str | None = None) -> str:
+    """Format a (bucketed) price using tick/bucket size. Avoids 0.100000000001."""
+    from decimal import Decimal, ROUND_HALF_EVEN
+
+    n = tick_display_decimals(tick, tick_raw)
+    if price is None:
+        return f"{0:.{n}f}"
+    try:
+        p = Decimal(str(price))
+    except Exception:
+        return f"{0:.{n}f}"
+    step = float(tick or 0.0)
+    if step > 0:
+        try:
+            t = Decimal(str(tick_raw).strip()) if tick_raw not in (None, "") else Decimal(str(tick))
+            if t > 0:
+                steps = (p / t).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN)
+                p = steps * t
+        except Exception:
+            pass
+    q = Decimal("1").scaleb(-n) if n else Decimal("1")
+    p = p.quantize(q, rounding=ROUND_HALF_EVEN)
+    return f"{p:.{n}f}"
+
+
 # Binance kline intervals. UI "24H" maps to 1d.
 KLINE_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
 INTERVAL_ALIASES = {
