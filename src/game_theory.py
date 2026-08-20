@@ -12,7 +12,7 @@ def interpret(symbol: str, snap: dict, scores: dict, state: str, reason: str) ->
     headline = _headline(state, ls, lc, ss, sc)
 
     facts = []
-    facts.append(f"Price {px:.6g} | 24h {snap.get('change_24h_pct', 0):+.2f}%")
+    facts.append(f"Price {float(px):.4f} | 24h {snap.get('change_24h_pct', 0):+.2f}%")
     facts.append(
         f"OI {oi.get('oi', 0):,.4g} | Δ1m {oi.get('chg_1m_pct', 0):+.3f}% "
         f"Δ15m {oi.get('chg_15m_pct', 0):+.3f}% Δ1h {oi.get('chg_1h_pct', 0):+.3f}%"

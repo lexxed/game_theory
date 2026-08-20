@@ -50,7 +50,11 @@ def _crowd_proxy(scores: dict, side: str) -> dict:
     score = float((comp or {}).get("normalized") or 0.0) * 100.0
     return {
         "score": round(score, 2),
-        "label": "PROXY only — funding percentile + advertised account LS ratio. Not long/short OI.",
+        "label": (
+            "PROXY only — 0.50 funding percentile + 0.25 LS_ACCOUNT "
+            "(global account ratio) + 0.25 top_pos_ratio (top-trader position-size ratio). "
+            "Not long/short OI."
+        ),
         "reason": (comp or {}).get("reason", ""),
     }
 

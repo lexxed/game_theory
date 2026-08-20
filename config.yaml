@@ -132,7 +132,7 @@ weights_setup:
   cvd_divergence: 16
   absorption: 16
   liquidation_risk: 13
-  price_structure: 5
+  price_structure: 3
   book_imbalance: 9
   taker_flow: 10
 

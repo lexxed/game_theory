@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.scoring import ScoreEngine
+from src.scoring import CROWD_ACCT_W, CROWD_FUND_W, CROWD_TOP_W, ScoreEngine, crowding_breakdown
 
 
 def _base(**kw):
@@ -11,6 +11,7 @@ def _base(**kw):
         "funding": 0.0001,
         "funding_pctile": 50,
         "ls_account_ratio": 1.0,
+        "top_pos_ratio": 1.0,
         "oi_chg_15m_pct": 0.0,
         "price_chg_1m_pct": 0.0,
         "price_chg_5m_pct": 0.0,
@@ -45,6 +46,7 @@ def test_long_trap_setup_rises_with_crowding_and_div():
             funding=0.001,
             funding_pctile=98,
             ls_account_ratio=2.2,
+            top_pos_ratio=2.0,
             oi_chg_15m_pct=0.8,
             price_chg_15m_pct=0.1,
             cvd_div={"bearish": True, "bullish": False, "bearish_strength": 0.9, "bullish_strength": 0, "reason": "hh"},
@@ -83,7 +85,9 @@ def test_confirmation_requires_adverse_flow():
 def test_weights_sum_displayed():
     out = ScoreEngine().compute(_base())
     w = sum(c["weight"] for c in out["long_setup"]["components"])
-    assert abs(w - 100) < 1e-6
+    ps = next(c for c in out["long_setup"]["components"] if c["name"] == "price_structure")
+    assert ps["weight"] == 3
+    assert abs(w - 98) < 1e-6
 
 
 def test_book_imbalance_raises_long_setup_only_with_thin_wall():
@@ -125,3 +129,49 @@ def test_taker_flow_rewards_intensifying_one_sided_buying():
     # heavy BUY flow should not boost the short setup's taker_flow component
     short_c = next(c for c in intensifying["short_setup"]["components"] if c["name"] == "taker_flow")
     assert short_c["points"] == 0
+
+
+def test_crowding_weights_sum_to_one():
+    assert abs(CROWD_FUND_W + CROWD_ACCT_W + CROWD_TOP_W - 1.0) < 1e-12
+    assert CROWD_FUND_W == 0.50
+    assert CROWD_ACCT_W == 0.25
+    assert CROWD_TOP_W == 0.25
+
+
+def test_crowding_neutral_is_fifty():
+    c = crowding_breakdown(_base(funding_pctile=50, ls_account_ratio=1.0, top_pos_ratio=1.0))
+    assert abs(c["long_100"] - 50.0) < 1e-6
+    assert abs(c["short_100"] - 50.0) < 1e-6
+
+
+def test_crowding_long_when_all_long_proxies():
+    c = crowding_breakdown(_base(funding_pctile=90, ls_account_ratio=1.8, top_pos_ratio=1.6))
+    assert c["long_100"] > 70
+    assert c["long_100"] > c["short_100"]
+    assert abs(c["long_100"] + c["short_100"] - 100.0) < 1e-6
+    assert "top_pos_ratio" in c["long_reason"]
+    assert "position-size" in c["long_reason"]
+    assert "account" in c["long_reason"].lower()
+    long_c = next(x for x in ScoreEngine().compute(_base(funding_pctile=90, ls_account_ratio=1.8, top_pos_ratio=1.6))["long_setup"]["components"] if x["name"] == "crowding")
+    assert abs(long_c["normalized"] * 100 - c["long_100"]) < 1e-4
+
+
+def test_crowding_short_when_all_short_proxies():
+    c = crowding_breakdown(_base(funding_pctile=10, ls_account_ratio=0.4, top_pos_ratio=0.5))
+    assert c["short_100"] > 70
+    assert c["short_100"] > c["long_100"]
+
+
+def test_crowding_extreme_ratio_clips_to_0_100():
+    hi = crowding_breakdown(_base(funding_pctile=100, ls_account_ratio=50.0, top_pos_ratio=50.0))
+    lo = crowding_breakdown(_base(funding_pctile=0, ls_account_ratio=0.0, top_pos_ratio=0.0))
+    assert 0.0 <= hi["long_100"] <= 100.0
+    assert 0.0 <= lo["long_100"] <= 100.0
+    assert abs(hi["long_100"] - 100.0) < 1e-6
+    assert abs(lo["long_100"] - 0.0) < 1e-6
+
+
+def test_top_pos_ratio_missing_is_neutral_not_crash():
+    c = crowding_breakdown(_base(funding_pctile=50, ls_account_ratio=1.0, top_pos_ratio=None))
+    assert abs(c["long_100"] - 50.0) < 1e-6
+    assert "missing" in c["long_reason"]

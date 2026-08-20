@@ -51,6 +51,82 @@ def _weights(kind: str) -> dict:
     return w
 
 
+# Inside the crowding COMPONENT (setup still has its own weight):
+#   0.50 funding percentile + 0.25 LS_ACCOUNT + 0.25 top_pos_ratio
+CROWD_FUND_W = 0.50
+CROWD_ACCT_W = 0.25
+CROWD_TOP_W = 0.25
+
+
+def _ratio_to_long_100(ratio) -> tuple[float, bool]:
+    """
+    Map a Binance long/short ratio to a 0-100 LONG crowding score.
+    1.0 → 50 (neutral). >1 increasingly long. <1 increasingly short.
+    Extreme values clip to 0 or 100. Missing/invalid → 50, present=False.
+    """
+    if ratio is None:
+        return 50.0, False
+    try:
+        r = float(ratio)
+    except (TypeError, ValueError):
+        return 50.0, False
+    if r != r:  # NaN
+        return 50.0, False
+    return round(100.0 * clip(r / 2.0), 4), True
+
+
+def crowding_breakdown(snap: dict) -> dict:
+    """Authoritative crowding mix. Returns 0-100 long/short plus contributions."""
+    fund_pct = float(snap.get("funding_pctile") if snap.get("funding_pctile") is not None else 50.0)
+    fund_long = clip(fund_pct, 0.0, 100.0)
+    ls_long, ls_ok = _ratio_to_long_100(snap.get("ls_account_ratio"))
+    top_long, top_ok = _ratio_to_long_100(snap.get("top_pos_ratio"))
+    long_100 = clip(
+        CROWD_FUND_W * fund_long + CROWD_ACCT_W * ls_long + CROWD_TOP_W * top_long,
+        0.0,
+        100.0,
+    )
+    short_100 = clip(100.0 - long_100, 0.0, 100.0)
+    fund_short = clip(100.0 - fund_long, 0.0, 100.0)
+    ls_short = clip(100.0 - ls_long, 0.0, 100.0)
+    top_short = clip(100.0 - top_long, 0.0, 100.0)
+    ls_raw = snap.get("ls_account_ratio")
+    top_raw = snap.get("top_pos_ratio")
+
+    def _reason(side: str) -> str:
+        if side == "long":
+            f_c, a_c, t_c, total = CROWD_FUND_W * fund_long, CROWD_ACCT_W * ls_long, CROWD_TOP_W * top_long, long_100
+            label = "LONG"
+        else:
+            f_c, a_c, t_c, total = CROWD_FUND_W * fund_short, CROWD_ACCT_W * ls_short, CROWD_TOP_W * top_short, short_100
+            label = "SHORT"
+        ls_txt = f"{float(ls_raw):.3f}" if ls_ok else "n/a (missing — treated as 1.0 / 50)"
+        top_txt = f"{float(top_raw):.3f}" if top_ok else "n/a (missing — treated as 1.0 / 50)"
+        return (
+            "CROWDING PROXY (not OI split; not a trap):\n"
+            f"  funding percentile = {fund_long:.1f}\n"
+            f"  LS_ACCOUNT = {ls_txt}  (Binance global account long/short ratio)\n"
+            f"  top_pos_ratio = {top_txt}  (Binance top-trader position-size long/short ratio)\n"
+            f"  funding contribution = {f_c:.2f}/{CROWD_FUND_W*100:.0f}\n"
+            f"  account contribution = {a_c:.2f}/{CROWD_ACCT_W*100:.0f}\n"
+            f"  top-position contribution = {t_c:.2f}/{CROWD_TOP_W*100:.0f}\n"
+            f"  {label} CROWDING = {total:.2f}/100"
+        )
+
+    return {
+        "fund_pct": fund_long,
+        "ls_account_ratio": float(ls_raw) if ls_ok else None,
+        "top_pos_ratio": float(top_raw) if top_ok else None,
+        "ls_long_100": ls_long,
+        "top_long_100": top_long,
+        "long_100": round(float(long_100), 4),
+        "short_100": round(float(short_100), 4),
+        "long_reason": _reason("long"),
+        "short_reason": _reason("short"),
+        "weights": {"funding": CROWD_FUND_W, "ls_account": CROWD_ACCT_W, "top_pos": CROWD_TOP_W},
+    }
+
+
 class ScoreEngine:
     def __init__(self):
         pass
@@ -80,29 +156,15 @@ class ScoreEngine:
         refs = get("scoring_refs", {})
         comps: list[Component] = []
 
-        # --- crowding (funding + advertised LS ratio; NOT actual long/short OI) ---
-        fund_pct = float(s.get("funding_pctile", 50.0))
-        ls = float(s.get("ls_account_ratio") or 1.0)
-        # ls>1 more accounts long
+        # --- crowding (funding + LS_ACCOUNT + top_pos_ratio; NOT OI split) ---
+        crowd = crowding_breakdown(s)
+        fund_pct = crowd["fund_pct"]
         if side == "long":
-            fund_n = clip((fund_pct - 50.0) / 50.0)
-            ls_n = clip((ls - 1.0) / 1.0)
-            raw = 0.65 * fund_n + 0.35 * ls_n
-            reason = (
-                f"CROWDING PROXY (not OI split): funding percentile {fund_pct:.0f}, "
-                f"advertised account LS ratio {ls:.3f} — not actual long/short positioning"
-            )
+            raw = crowd["long_100"] / 100.0
+            reason = crowd["long_reason"]
         else:
-            fund_n = clip((50.0 - fund_pct) / 50.0)
-            ls_n = clip((1.0 - ls) / 1.0)
-            raw = 0.65 * fund_n + 0.35 * ls_n
-            reason = (
-                f"CROWDING PROXY (not OI split): funding percentile {fund_pct:.0f} (low = short-side proxy), "
-                f"advertised account LS ratio {ls:.3f} — not actual short positioning"
-            )
-        if s.get("ls_account_ratio") is None:
-            raw *= 0.7
-            reason += " — LS ratio unavailable, funding-only and capped 70%"
+            raw = crowd["short_100"] / 100.0
+            reason = crowd["short_reason"]
         comps.append(_comp("crowding", raw, raw, w.get("crowding", 15), reason))
 
         # --- OI behavior ---
@@ -192,7 +254,7 @@ class ScoreEngine:
         else:
             raw = 0.6 * float(bool(st.get("near_low"))) + 0.4 * float(bool(st.get("failed_breakdown")))
             reason = st.get("reason", "") + " (short-trap structure = near lows / failed breakdown)"
-        comps.append(_comp("price_structure", raw, raw, w.get("price_structure", 5), reason))
+        comps.append(_comp("price_structure", raw, raw, w.get("price_structure", 3), reason))
 
         # --- order book imbalance (resting liquidity, not executed volume) ---
         ob = s.get("orderbook") or {}

@@ -62,7 +62,7 @@ def format_copy_snapshot(snap: dict, symbol_override: str = "", grok_comment: st
         f"REASON  {snap.get('state_reason')}",
         "",
         "KPIs",
-        f"  PRICE           {f.get('price')}",
+        f"  PRICE           {float(f.get('price') or 0):.4f}",
         f"  24H             {f.get('change_24h_pct')}%",
         f"  OI              {oi.get('oi')}",
         f"  OI 1m/5m/15m/1h {oi.get('chg_1m_pct')} / {oi.get('chg_5m_pct')} / {oi.get('chg_15m_pct')} / {oi.get('chg_1h_pct')} %",
@@ -198,7 +198,7 @@ def _kpi_html(s: dict) -> str:
     px = f.get("price") or 0
     return f"""
     <div style="font-family:Segoe UI,system-ui,sans-serif;display:flex;flex-wrap:wrap;gap:10px">
-      {_card('PRICE', f'{px:,.6g}')}
+      {_card('PRICE', f'{float(px):.4f}')}
       {_card('24H', f"{f.get('change_24h_pct',0):+.2f}%")}
       {_card('OI', f"{oi.get('oi',0):,.2f}")}
       {_card('OI 15m', f"{oi.get('chg_15m_pct',0):+.3f}%")}
@@ -279,20 +279,25 @@ def _score_html(title: str, setup: dict, confirm: dict, state: str) -> str:
 def _fp_html(rows: list[dict], n: int = 18) -> str:
     if not rows:
         return "<i>No footprint yet — waiting for trades on this candle.</i>"
+    cell = "border:1px solid #ddd;padding:3px 8px;white-space:nowrap"
     body = []
     for r in rows[:n]:
-        d = r["delta"]
+        d = float(r.get("delta") or 0.0)
         col = "#0a0" if d > 0 else "#c00" if d < 0 else "#444"
         body.append(
-            f"<tr><td>{r['price']:.6g}</td>"
-            f"<td style='text-align:right'>{r['bid']:.4g}</td>"
-            f"<td style='text-align:right'>{r['ask']:.4g}</td>"
-            f"<td style='text-align:right;color:{col}'>{d:+.4g}</td></tr>"
+            "<tr>"
+            f"<td style='{cell}'>{float(r.get('price') or 0):.4f}</td>"
+            f"<td style='{cell};text-align:right'>{float(r.get('bid') or 0):,.4f}</td>"
+            f"<td style='{cell};text-align:right'>{float(r.get('ask') or 0):,.4f}</td>"
+            f"<td style='{cell};text-align:right;color:{col}'>{d:+,.4f}</td>"
+            "</tr>"
         )
+    th = f"style='{cell};text-align:left;font-weight:650'"
     return (
         "<div style='font-family:Consolas,monospace;font-size:12px'>"
-        "<b>FOOTPRINT</b> (ask = aggressive buy, bid = aggressive sell)<br>"
-        "<table><tr><th>PRICE</th><th>BID</th><th>ASK</th><th>DELTA</th></tr>"
+        "<b>FOOTPRINT</b> (ask = aggressive buy volume, bid = aggressive sell volume)<br>"
+        f"<table style='border-collapse:collapse;margin-top:4px'>"
+        f"<tr><th {th}>PRICE</th><th {th}>BID</th><th {th}>ASK</th><th {th}>DELTA</th></tr>"
         + "".join(body)
         + "</table></div>"
     )
@@ -651,7 +656,7 @@ class Dashboard:
                     close=[b["close"] for b in bars],
                 )
             )
-            fig.update_layout(**_layout(f"{snap['symbol']} {tf}", 320))
+            fig.update_layout(**_layout(f"{snap['symbol']} {tf}", 320), yaxis_tickformat=".4f")
             _set_chart(self.fig_px, fig)
 
         oi = snap.get("oi_hist") or []
