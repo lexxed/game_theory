@@ -126,6 +126,26 @@ def test_confirm_still_outranks_developing():
     assert state == "POTENTIAL LONG TRAP"
 
 
+def test_grok_snapshot_copies_developing_flag():
+    from src.grok_interface import compact_snapshot
+
+    snap = _base(
+        funding_pctile=90,
+        ls_account_ratio=1.8,
+        top_pos_ratio=1.6,
+        price=99.5,
+        recent_local_high=100.0,
+        cvd_chg_1m=-10.0,
+        cvd_chg_3m=-8.0,
+    )
+    scores, g, state = _run(snap)
+    text = compact_snapshot("TESTUSDT", snap, scores, state)
+    assert "VERBATIM ENGINE LABELS" in text
+    assert "LONG_TRAP_DEVELOPING: true" in text
+    assert g["long_trap_developing"] is True
+    assert "LONG_TRAP_CONFIRMATION_GATE: false" in text
+
+
 def test_recent_high_uses_only_existing_bars():
     from src.price_structure import PriceStructure
 

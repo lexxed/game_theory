@@ -39,8 +39,12 @@ re-score, do not place trades, do not claim certainty.
 - LONG FORCED FLOW requires meaningful long liq AND falling price AND falling CVD AND declining OI.
 - Cascade STATE requires the cascade GATE (intensity + meaningful same-side liq + direction). Intensity (CASCADE_LONG/SHORT) is price/OI/CVD only and is NOT a cascade by itself.
 - Funding percentile and account LS ratio are CROWDING PROXIES, not long/short OI.
-- LONG TRAP DEVELOPING is an early warning only. It is NOT confirmation and NOT a trade entry.
+- LONG TRAP DEVELOPING in the SNAPSHOT is an engine boolean. Copy it. Do not recompute it.
+  It is an early warning only. It is NOT confirmation and NOT a trade entry.
+  LONG_TRAP_DEVELOPING=true AND LONG_TRAP_CONFIRMATION_GATE=false is VALID and common.
+  Do NOT report developing as false because confirmation is false.
   Confirm remains LONG_TRAP_CONFIRMATION_GATE. Do not upgrade DEVELOPING to CONFIRMING.
+  If ENGINE_STATE is LONG TRAP DEVELOPING or LONG TRAP DEVELOPING STRONG, developing is true.
 
 ## Allowed STATE values (exact strings)
 - NEUTRAL
@@ -103,11 +107,14 @@ ENGINE_STATE: <verbatim STATE>
 TRADE_STATUS: <verbatim TRADE_STATUS>
 SETUP_VS_CONFIRM: long setup/confirm-score = A/B ; short setup/confirm-score = C/D  (scores only; B and D are NOT gates)
 CONFIRMATION_GATE: long=<true/false> short=<true/false>
+LONG_TRAP_DEVELOPING: <verbatim true/false from SNAPSHOT>
+LONG_TRAP_DEVELOPING_STRONG: <verbatim true/false from SNAPSHOT>
+LONG_TRAP_DEVELOPING_SCORE: <verbatim number from SNAPSHOT>
 VULNERABLE_SIDE: LONGS | SHORTS | UNCLEAR
 ABSORPTION: NONE | BUY ABSORPTION | SELL ABSORPTION | UNCLEAR  (use engine flags, not vibes)
 LIQ_EVENT: NONE | LONG | SHORT | BOTH
 FORCED_FLOW: NONE | LONG FORCED FLOW | SHORT FORCED FLOW | CASCADE | UNCLEAR
-TRAP_STATUS: NO TRAP | LONG SETUP ONLY | LONG SETUP+CONFIRM | SHORT SETUP ONLY | SHORT SETUP+CONFIRM
+TRAP_STATUS: NO TRAP | LONG SETUP ONLY | LONG TRAP DEVELOPING | LONG TRAP DEVELOPING STRONG | LONG SETUP+CONFIRM | SHORT SETUP ONLY | SHORT SETUP+CONFIRM
 INVALIDATION: <what would break THIS state's reading, in the engine's terms>
 COMMENT: <6-10 sentences applying the rules to the snapshot. Label any extra inference as INTERPRETATION.>
 """
@@ -116,7 +123,8 @@ COMMENT: <6-10 sentences applying the rules to the snapshot. Label any extra inf
 TASK = """
 Comment on the SNAPSHOT using ENGINE INTERPRETATION RULES above.
 Do not recalculate scores. Do not narrate. Do not invent data.
-Use the engine's STATE string verbatim.
+Copy ENGINE_STATE, TRADE_STATUS, LONG_TRAP_DEVELOPING, and LONG_TRAP_CONFIRMATION_GATE
+verbatim from VERBATIM ENGINE LABELS / JSON. Do not recompute developing from CVD or structure.
 """
 
 
@@ -203,6 +211,21 @@ def compact_snapshot(
     ab = snap.get("absorption") or {}
     div = snap.get("cvd_div") or {}
     st = snap.get("structure") or {}
+    g = scores.get("gates") or {}
+    labels = {
+        "ENGINE_STATE": state,
+        "TRADE_STATUS": g.get("trade_status", "WAIT"),
+        "LONG_TRAP_DEVELOPING": bool(g.get("long_trap_developing", False)),
+        "LONG_TRAP_DEVELOPING_STRONG": bool(g.get("long_trap_developing_strong", False)),
+        "LONG_TRAP_DEVELOPING_SCORE": g.get("long_trap_developing_score", 0),
+        "LONG_TRAP_CONFIRMATION_GATE": bool(g.get("long_trap_confirmation", False)),
+        "SHORT_TRAP_CONFIRMATION_GATE": bool(g.get("short_trap_confirmation", False)),
+    }
+    header = (
+        "# VERBATIM ENGINE LABELS (copy these; do not recompute)\n"
+        + "\n".join(f"{k}: {json.dumps(v) if isinstance(v, bool) else v}" for k, v in labels.items())
+        + "\n\n# SNAPSHOT JSON\n"
+    )
     payload = {
         "symbol": symbol,
         "STATE": state,
@@ -287,6 +310,8 @@ def compact_snapshot(
             "CVD is aggressive flow, not identity",
             "Liquidations are OBSERVED force-orders only",
             "High setup is not a price forecast",
+            "LONG_TRAP_DEVELOPING true with CONFIRM false is valid",
         ],
     }
-    return json.dumps(payload, default=str, indent=2)
+    payload.update(labels)
+    return header + json.dumps(payload, default=str, indent=2)

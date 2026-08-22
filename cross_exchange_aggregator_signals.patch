@@ -1,0 +1,1011 @@
+diff --git a/attribution.py b/attribution.py
+new file mode 100644
+index 0000000..1153dce
+--- /dev/null
++++ b/attribution.py
+@@ -0,0 +1,221 @@
++"""
++Per-signal attribution: which scoring components actually correlate with
++what happened afterward, at each horizon.
++
++This is deliberately separate from backtest.py, which reports forward
++returns after the *total* score crosses a threshold. attribution.py instead
++explodes stored snapshots into one row per (timestamp, component) and asks,
++for each component independently: when this component's raw value / points
++were high, did forward returns skew the direction the component implies?
++
++Metrics per component x horizon:
++  n           - snapshots where the component had a non-degenerate raw value
++  ic_pearson  - Pearson correlation of component.raw vs forward return
++  ic_spearman - Spearman (rank) correlation — more robust to outliers/units
++  top_q_ret   - mean forward return when raw is in the top quintile
++  bot_q_ret   - mean forward return when raw is in the bottom quintile
++  spread      - top_q_ret - bot_q_ret (the useful number: does high vs low
++                actually separate outcomes, regardless of sign convention)
++
++IC is computed against SIGNED forward return for the "long_setup" family and
++against the mirrored (negated) forward return for "short_setup" so that, in
++both cases, a positive IC means "this component moving toward its intended
++direction is followed by the intended (adverse, since these are trap-risk
++scores) move." Read: for long_setup components, positive IC means high
++component values preceded price going DOWN in that horizon — this is a trap/
++vulnerability score, not a long signal.
++
++LIMIT: correlational, not causal, not walk-forward, no transaction costs.
++This tells you which components are worth keeping/reweighting/replacing —
++it is not a validated trading edge. Small n per component is common early on
++(a component only enters the report once it has fired with a non-zero raw
++value); treat n < 30 as exploratory only.
++
++Usage (from this folder):
++    python attribution.py
++    python attribution.py --symbol BTCUSDT --side long --top 15
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++ROOT = Path(__file__).resolve().parent
++sys.path.insert(0, str(ROOT))
++
++from src.storage import Storage  # noqa: E402
++from backtest import HORIZONS  # noqa: E402
++
++
++def load_scores_and_candles(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
++    st = Storage()
++    scores = st.query(
++        "SELECT ts, state, components_json FROM scores WHERE symbol = ? ORDER BY ts",
++        [symbol],
++    )
++    candles = st.query(
++        "SELECT open_time, close FROM candles WHERE symbol = ? AND interval = '15m' ORDER BY open_time",
++        [symbol],
++    )
++    return scores, candles
++
++
++def _forward_returns(ts_series: pd.Series, candles: pd.DataFrame) -> pd.DataFrame:
++    """For each ts, forward return at each horizon vs the 15m candle close
++    at-or-before ts. Same join logic as backtest.forward_stats, factored out
++    so both tools stay consistent."""
++    if candles.empty:
++        return pd.DataFrame(index=ts_series.index)
++    candles = candles.sort_values("open_time")
++    closes = candles["close"].to_numpy()
++    times = candles["open_time"].to_numpy()
++    out = {f"ret_{name}": [] for name in HORIZONS}
++    for ts in ts_series:
++        ts = int(ts)
++        i = int((times <= ts).sum() - 1)
++        if i < 0 or i >= len(closes) - 1:
++            for name in HORIZONS:
++                out[f"ret_{name}"].append(None)
++            continue
++        entry = float(closes[i])
++        for name, ms in HORIZONS.items():
++            j = int((times <= ts + ms).sum() - 1)
++            out[f"ret_{name}"].append(closes[j] / entry - 1.0 if j > i else None)
++    return pd.DataFrame(out, index=ts_series.index)
++
++
++def explode_components(scores: pd.DataFrame, side: str) -> pd.DataFrame:
++    """One row per (ts, component_name) with raw/normalized/points."""
++    key = f"{side}_setup"
++    rows = []
++    for _, r in scores.iterrows():
++        blob = r.get("components_json")
++        if not blob:
++            continue
++        try:
++            comps = json.loads(blob).get(key, [])
++        except (TypeError, ValueError):
++            continue
++        for c in comps:
++            rows.append(
++                {
++                    "ts": r["ts"],
++                    "state": r.get("state"),
++                    "component": c.get("name"),
++                    "raw": c.get("raw"),
++                    "normalized": c.get("normalized"),
++                    "points": c.get("points"),
++                }
++            )
++    return pd.DataFrame(rows)
++
++
++def _quintile_spread(raw: pd.Series, ret: pd.Series) -> tuple[float | None, float | None]:
++    """Top vs bottom quintile mean return. Falls back to a simple median
++    split for low-cardinality (e.g. binary flag) components, since pd.qcut
++    needs enough distinct values to carve 5 real bins."""
++    df = pd.DataFrame({"raw": raw, "ret": ret}).dropna()
++    if len(df) < 10 or df["raw"].nunique() < 2:
++        return None, None
++    if df["raw"].nunique() < 5:
++        med = df["raw"].median()
++        top = df.loc[df["raw"] > med, "ret"]
++        bot = df.loc[df["raw"] <= med, "ret"]
++        if top.empty or bot.empty:
++            return None, None
++        return float(top.mean()), float(bot.mean())
++    try:
++        df["q"] = pd.qcut(df["raw"], 5, labels=False, duplicates="drop")
++    except ValueError:
++        return None, None
++    if df["q"].max() < df["q"].min() + 1:
++        return None, None
++    top = df.loc[df["q"] == df["q"].max(), "ret"].mean()
++    bot = df.loc[df["q"] == df["q"].min(), "ret"].mean()
++    return float(top), float(bot)
++
++
++def attribute(symbol: str, side: str) -> pd.DataFrame:
++    scores, candles = load_scores_and_candles(symbol)
++    if scores.empty:
++        return pd.DataFrame()
++    exploded = explode_components(scores, side)
++    if exploded.empty:
++        return pd.DataFrame()
++    fwd = _forward_returns(scores["ts"], candles)
++    fwd.index = scores.index
++    scores = scores.join(fwd)
++    ts_to_rets = scores.set_index("ts")[[f"ret_{h}" for h in HORIZONS]]
++    exploded = exploded.join(ts_to_rets, on="ts")
++
++    # Trap-risk scores predict an ADVERSE move. Mirror the sign for shorts
++    # so that positive IC always means "component correctly anticipated the
++    # direction its own name implies" across both long and short reports.
++    sign = -1.0 if side == "long" else 1.0
++
++    rows = []
++    for name, grp in exploded.groupby("component"):
++        rec = {"component": name}
++        nz = grp[grp["raw"].abs() > 1e-9]
++        rec["n_nonzero"] = int(len(nz))
++        for h in HORIZONS:
++            col = f"ret_{h}"
++            d = grp[["raw", col]].dropna()
++            if len(d) < 10 or d["raw"].nunique() < 2:
++                rec[f"ic_pearson_{h}"] = None
++                rec[f"ic_spearman_{h}"] = None
++                rec[f"spread_{h}"] = None
++                continue
++            signed_ret = sign * d[col]
++            rec[f"ic_pearson_{h}"] = float(np.corrcoef(d["raw"], signed_ret)[0, 1])
++            rec[f"ic_spearman_{h}"] = float(
++                pd.Series(d["raw"]).rank().corr(pd.Series(signed_ret).rank())
++            )
++            top, bot = _quintile_spread(d["raw"], signed_ret)
++            rec[f"spread_{h}"] = (top - bot) if (top is not None and bot is not None) else None
++        rows.append(rec)
++    out = pd.DataFrame(rows)
++    if out.empty:
++        return out
++    rank_col = f"ic_spearman_{list(HORIZONS)[1]}"  # default sort: 15m horizon
++    if rank_col in out.columns:
++        order = pd.to_numeric(out[rank_col], errors="coerce").abs().sort_values(ascending=False, na_position="last").index
++        out = out.reindex(order)
++    return out.reset_index(drop=True)
++
++
++def main() -> None:
++    p = argparse.ArgumentParser(description="Per-signal attribution: does each component's raw value correlate with forward returns?")
++    p.add_argument("--symbol", default="BTCUSDT")
++    p.add_argument("--side", default="long", choices=["long", "short"])
++    p.add_argument("--top", type=int, default=20, help="max rows to print")
++    args = p.parse_args()
++
++    out = attribute(args.symbol, args.side)
++    if out.empty:
++        print(f"No stored components for {args.symbol} ({args.side}_setup) yet, or no overlapping candle history.")
++        print("Run the dashboard so snapshots flush to DuckDB (components_json requires this update to market_data.py).")
++        return
++
++    print(f"Per-signal attribution — {args.symbol} {args.side}_setup components")
++    print(f"n_nonzero = snapshots where the component fired with a non-zero raw value; treat n < 30 as exploratory.\n")
++    show_cols = ["component", "n_nonzero"] + [
++        c for h in HORIZONS for c in (f"ic_spearman_{h}", f"spread_{h}")
++    ]
++    print(out[show_cols].head(args.top).to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
++    print()
++    print("Reading this: ic_spearman near 0 = component isn't separating outcomes at that horizon.")
++    print("spread = mean forward return (top quintile) - mean forward return (bottom quintile) of the")
++    print("component's own raw value, sign-adjusted so positive always means 'worked as intended.'")
++    print()
++    print("LIMIT: correlational, not causal, no transaction costs, no walk-forward split. Not a validated edge.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/config.yaml b/config.yaml
+index b342e8e..eca6a94 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -131,20 +131,40 @@ state_machine:
+   crowding_enter: 60
+ 
+ # Setup scores (must sum to 100)
+-# NOTE: weights have been trimmed twice (proportionally, rounded) to make
+-# room first for book_imbalance, then for taker_flow, below. Rebalance
+-# further to taste — the code doesn't require this to sum to exactly 100,
+-# but the dashboard's score display assumes a 0-100 scale by convention.
++# NOTE: weights have been trimmed three times (proportionally, rounded) to
++# make room first for book_imbalance, then taker_flow, then the two
++# cross-exchange/aggregator components below. Rebalance further to taste —
++# the code doesn't require this to sum to exactly 100, but the dashboard's
++# score display assumes a 0-100 scale by convention.
++#
++# cross_funding_divergence / market_regime start deliberately small: they're
++# context/confirmation signals (is this Binance-only, is the broader market
++# aligned?), not primary trap evidence, and they depend on third-party
++# endpoints that can be slow/unavailable (see external_signals.py) — when
++# data is missing they score 0, so keeping their weight low limits how much
++# an outage can silently drag a score down. Increase once you've backtested
++# them (see attribution.py) and trust the signal.
+ weights_setup:
+-  crowding: 11
+-  oi_behavior: 12
+-  funding: 8
+-  cvd_divergence: 16
+-  absorption: 16
+-  liquidation_risk: 13
++  crowding: 10
++  oi_behavior: 11
++  funding: 7
++  cvd_divergence: 15
++  absorption: 15
++  liquidation_risk: 12
+   price_structure: 3
+-  book_imbalance: 9
+-  taker_flow: 10
++  book_imbalance: 8
++  taker_flow: 9
++  cross_funding_divergence: 5
++  market_regime: 5
++
++external_signals:
++  cross_venue_poll_s: 30.0     # OKX/Bybit/Crypto.com funding+price — cheap, poll often
++  regime_poll_s: 300.0         # CoinGecko/CMC global — slow-moving, poll every 5m
++
++aggregators:
++  # Optional. CoinGecko needs no key. Set this (or env var CMC_API_KEY) to
++  # also pull CoinMarketCap as a fallback/cross-check for regime data.
++  coinmarketcap_api_key: null
+ 
+ # Confirmation scores (must sum to 100)
+ weights_confirm:
+diff --git a/src/external_signals.py b/src/external_signals.py
+new file mode 100644
+index 0000000..13cd842
+--- /dev/null
++++ b/src/external_signals.py
+@@ -0,0 +1,167 @@
++"""
++Cross-exchange + aggregator signal tracker.
++
++Polls OKX / Bybit / Crypto.com / CoinGecko (and CoinMarketCap if a key is
++configured) on their own low-frequency schedule (these are context signals,
++not tick data) and exposes a snapshot() dict that scoring.py reads.
++
++Design mirrors funding.py / oi.py: a small stateful tracker with its own
++Ring history, isolated from the Binance websocket/REST path so a slow or
++down third-party endpoint can never block or crash the primary feed.
++
++Missing data is represented explicitly (None / present=False in the reason
++string) rather than silently defaulted to "neutral" — scoring.py is
++responsible for deciding how to score an absent signal (currently: no
++points, not a fabricated midpoint), matching the existing convention for
++ls_account_ratio / top_pos_ratio in scoring.py's _ratio_to_long_100.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++
++from config import get
++from src.external_venues import (
++    bybit_funding_and_price,
++    cmc_api_key,
++    coingecko_global,
++    coinmarketcap_global,
++    cryptocom_ticker,
++    okx_funding_and_price,
++)
++from src.utils import Ring, now_ms, safe_float
++
++log = logging.getLogger(__name__)
++
++# Binance symbol -> per-venue instrument id. Extend as more symbols are traded.
++_SYMBOL_MAP = {
++    "BTCUSDT": {"okx": "BTC-USDT-SWAP", "bybit": "BTCUSDT", "cryptocom": "BTCUSD-PERP"},
++    "ETHUSDT": {"okx": "ETH-USDT-SWAP", "bybit": "ETHUSDT", "cryptocom": "ETHUSD-PERP"},
++}
++
++
++class ExternalSignalTracker:
++    def __init__(self, symbol: str):
++        self.symbol = symbol.upper()
++        self.venue_ids = _SYMBOL_MAP.get(self.symbol)
++        self._lock = threading.Lock()
++        self._stop = threading.Event()
++        self._thread: threading.Thread | None = None
++
++        self.cross_funding: dict = {}      # per-venue funding + Binance comparison
++        self.cross_basis: dict = {}        # per-venue price + Binance comparison
++        self.regime: dict = {}             # CoinGecko/CMC dominance + mcap momentum
++        self.regime_hist = Ring(500)       # for momentum of dominance itself
++        self.last_poll_ts = 0.0
++        self.last_regime_poll_ts = 0.0
++        self.available = self.venue_ids is not None
++
++    def start(self) -> None:
++        if not self.available:
++            log.info("external_signals: no venue map for %s, tracker idle", self.symbol)
++            return
++        self._thread = threading.Thread(target=self._loop, daemon=True, name="external-signals")
++        self._thread.start()
++
++    def stop(self) -> None:
++        self._stop.set()
++
++    # -- polling ------------------------------------------------------------
++
++    def _loop(self) -> None:
++        cross_poll_s = float(get("external_signals.cross_venue_poll_s", 30.0))
++        regime_poll_s = float(get("external_signals.regime_poll_s", 300.0))
++        while not self._stop.is_set():
++            now = time.time()
++            try:
++                if now - self.last_poll_ts >= cross_poll_s:
++                    self._poll_cross_venue()
++                    self.last_poll_ts = now
++                if now - self.last_regime_poll_ts >= regime_poll_s:
++                    self._poll_regime()
++                    self.last_regime_poll_ts = now
++            except Exception:
++                log.exception("external_signals loop")
++            self._stop.wait(2.0)
++
++    def _poll_cross_venue(self, binance_funding: float | None = None, binance_price: float | None = None) -> None:
++        ids = self.venue_ids
++        okx = okx_funding_and_price(ids["okx"])
++        bybit = bybit_funding_and_price(ids["bybit"])
++        ccom = cryptocom_ticker(ids["cryptocom"])
++        with self._lock:
++            self._last_okx, self._last_bybit, self._last_ccom = okx, bybit, ccom
++
++    def _poll_regime(self) -> None:
++        cg = coingecko_global()
++        cmc = coinmarketcap_global(cmc_api_key())
++        src = cg or cmc  # CoinGecko preferred (no key needed); CMC as fallback
++        if src is None:
++            return
++        with self._lock:
++            prev = self.regime.get("btc_dominance_pct")
++            self.regime = {
++                **src,
++                "source": "coingecko" if src is cg else "coinmarketcap",
++                "btc_dominance_chg_from_prev_poll": (
++                    src["btc_dominance_pct"] - prev if prev is not None else None
++                ),
++            }
++            self.regime_hist.append({"ts": now_ms(), "btc_dominance_pct": src["btc_dominance_pct"]})
++
++    # -- feature computation --------------------------------------------------
++
++    def compute(self, binance_funding: float | None, binance_price: float | None) -> dict:
++        """
++        Called from the score loop (cheap, no I/O — just combines whatever
++        the background poller last fetched with the live Binance values).
++        """
++        with self._lock:
++            okx = getattr(self, "_last_okx", None)
++            bybit = getattr(self, "_last_bybit", None)
++            ccom = getattr(self, "_last_ccom", None)
++            regime = dict(self.regime) if self.regime else {}
++            hist = list(self.regime_hist)
++
++        venues = [v for v in (okx, bybit) if v and v.get("funding_rate") is not None]
++        funding_divergence = None
++        funding_reason = "no cross-exchange funding data yet"
++        if venues and binance_funding is not None:
++            avg_other = sum(v["funding_rate"] for v in venues) / len(venues)
++            funding_divergence = safe_float(binance_funding) - avg_other
++            names = "/".join(v["venue"] for v in venues)
++            funding_reason = (
++                f"Binance funding {binance_funding:+.6f} vs {names} avg {avg_other:+.6f} "
++                f"(divergence {funding_divergence:+.6f})"
++            )
++
++        price_venues = [v for v in (okx, bybit, ccom) if v and v.get("price")]
++        basis_pct = None
++        basis_reason = "no cross-exchange price data yet"
++        if price_venues and binance_price:
++            avg_other_px = sum(v["price"] for v in price_venues) / len(price_venues)
++            basis_pct = (safe_float(binance_price) - avg_other_px) / avg_other_px * 100.0 if avg_other_px else None
++            names = "/".join(v["venue"] for v in price_venues)
++            basis_reason = (
++                f"Binance {binance_price:,.2f} vs {names} avg {avg_other_px:,.2f} "
++                f"(basis {basis_pct:+.4f}% — Binance-specific leverage/liquidity skew if wide)"
++            )
++
++        dom_momentum = None
++        if len(hist) >= 2:
++            dom_momentum = hist[-1]["btc_dominance_pct"] - hist[0]["btc_dominance_pct"]
++
++        return {
++            "cross_funding_divergence": funding_divergence,
++            "cross_funding_reason": funding_reason,
++            "cross_funding_venues": [v["venue"] for v in venues],
++            "cross_basis_pct": basis_pct,
++            "cross_basis_reason": basis_reason,
++            "cross_basis_venues": [v["venue"] for v in price_venues],
++            "btc_dominance_pct": regime.get("btc_dominance_pct"),
++            "btc_dominance_momentum": dom_momentum,
++            "total_mcap_chg_24h_pct": regime.get("total_mcap_chg_24h_pct"),
++            "regime_source": regime.get("source"),
++        }
+diff --git a/src/external_venues.py b/src/external_venues.py
+new file mode 100644
+index 0000000..b04bd12
+--- /dev/null
++++ b/src/external_venues.py
+@@ -0,0 +1,152 @@
++"""
++Public, keyless REST clients for cross-exchange and aggregator context data.
++
++These are NOT the primary feed (Binance still is). They exist to answer:
++  - is Binance funding/price an outlier vs the rest of the market, or is the
++    whole market positioned the same way?
++  - is the broader market (BTC dominance / total cap momentum) rotating in a
++    way that supports or contradicts a single-symbol trap read?
++
++Every function fails soft: on any network/parspace error it returns None (or
++an empty dict) rather than raising, so a slow/down third-party endpoint never
++takes the dashboard down. Callers must treat missing data as "unknown", not
++"neutral/zero" — see external_signals.py for how that's handled.
++"""
++
++from __future__ import annotations
++
++import time
++from typing import Any
++
++import requests
++
++from config import get
++
++_UA = {"Accept": "application/json", "User-Agent": "gt-dashboard/1.0"}
++
++
++def _get(url: str, params: dict | None = None, timeout: float = 6.0) -> Any:
++    try:
++        r = requests.get(url, params=params, timeout=timeout, headers=_UA)
++        if r.status_code >= 400:
++            return None
++        return r.json()
++    except (requests.RequestException, ValueError):
++        return None
++
++
++# --------------------------------------------------------------------------
++# Cross-exchange perp funding + mark price (keyless)
++# --------------------------------------------------------------------------
++
++def okx_funding_and_price(inst_id: str) -> dict | None:
++    """inst_id e.g. 'BTC-USDT-SWAP'."""
++    fr = _get("https://www.okx.com/api/v5/public/funding-rate", {"instId": inst_id})
++    tk = _get("https://www.okx.com/api/v5/market/ticker", {"instId": inst_id})
++    try:
++        frow = (fr or {}).get("data", [{}])[0]
++        trow = (tk or {}).get("data", [{}])[0]
++        return {
++            "venue": "okx",
++            "funding_rate": float(frow.get("fundingRate")) if frow.get("fundingRate") else None,
++            "price": float(trow.get("last")) if trow.get("last") else None,
++            "ts": int(time.time() * 1000),
++        }
++    except (TypeError, ValueError, IndexError, KeyError):
++        return None
++
++
++def bybit_funding_and_price(symbol: str) -> dict | None:
++    """symbol e.g. 'BTCUSDT' (linear perp)."""
++    data = _get(
++        "https://api.bybit.com/v5/market/tickers",
++        {"category": "linear", "symbol": symbol},
++    )
++    try:
++        row = (data or {}).get("result", {}).get("list", [{}])[0]
++        return {
++            "venue": "bybit",
++            "funding_rate": float(row.get("fundingRate")) if row.get("fundingRate") else None,
++            "price": float(row.get("lastPrice")) if row.get("lastPrice") else None,
++            "ts": int(time.time() * 1000),
++        }
++    except (TypeError, ValueError, IndexError, KeyError):
++        return None
++
++
++def cryptocom_ticker(instrument: str) -> dict | None:
++    """instrument e.g. 'BTCUSD-PERP' on Crypto.com Exchange public API."""
++    data = _get(
++        "https://api.crypto.com/exchange/v1/public/get-tickers",
++        {"instrument_name": instrument},
++    )
++    try:
++        row = (data or {}).get("result", {}).get("data", [{}])[0]
++        # 'a' = best ask, 'b' = best bid on Crypto.com's ticker schema
++        bid = float(row.get("b")) if row.get("b") else None
++        ask = float(row.get("a")) if row.get("a") else None
++        mid = (bid + ask) / 2.0 if bid and ask else None
++        return {
++            "venue": "crypto.com",
++            "price": mid,
++            "volume_24h": float(row.get("v")) if row.get("v") else None,
++            "ts": int(time.time() * 1000),
++        }
++    except (TypeError, ValueError, IndexError, KeyError):
++        return None
++
++
++# --------------------------------------------------------------------------
++# Aggregator / macro-regime context (keyless: CoinGecko public API)
++# --------------------------------------------------------------------------
++
++def coingecko_global() -> dict | None:
++    """BTC dominance + total market cap, used as a coarse regime signal."""
++    data = _get("https://api.coingecko.com/api/v3/global")
++    try:
++        d = (data or {}).get("data", {})
++        return {
++            "btc_dominance_pct": float(d["market_cap_percentage"]["btc"]),
++            "eth_dominance_pct": float(d["market_cap_percentage"].get("eth", 0.0)),
++            "total_mcap_usd": float(d["total_market_cap"]["usd"]),
++            "total_mcap_chg_24h_pct": float(d.get("market_cap_change_percentage_24h_usd", 0.0)),
++            "ts": int(time.time() * 1000),
++        }
++    except (TypeError, ValueError, KeyError):
++        return None
++
++
++def coinmarketcap_global(api_key: str | None) -> dict | None:
++    """
++    Optional. CoinMarketCap's API requires a key (unlike CoinGecko/OKX/Bybit/
++    Crypto.com above). Returns None if no key is configured — this source is
++    then simply absent from cross_market_regime() rather than erroring.
++    Set the key via config.yaml: aggregators.coinmarketcap_api_key (or the
++    CMC_API_KEY environment variable).
++    """
++    if not api_key:
++        return None
++    try:
++        r = requests.get(
++            "https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest",
++            headers={**_UA, "X-CMC_PRO_API_KEY": api_key},
++            timeout=6.0,
++        )
++        if r.status_code >= 400:
++            return None
++        d = r.json().get("data", {})
++        q = d.get("quote", {}).get("USD", {})
++        return {
++            "btc_dominance_pct": float(d.get("btc_dominance", 0.0)),
++            "total_mcap_usd": float(q.get("total_market_cap", 0.0)),
++            "total_mcap_chg_24h_pct": float(q.get("total_market_cap_yesterday_percentage_change", 0.0)),
++            "ts": int(time.time() * 1000),
++        }
++    except (requests.RequestException, ValueError, TypeError, KeyError):
++        return None
++
++
++def cmc_api_key() -> str | None:
++    import os
++
++    return get("aggregators.coinmarketcap_api_key") or os.environ.get("CMC_API_KEY")
+diff --git a/src/market_data.py b/src/market_data.py
+index 0a0d0a4..cbaf735 100644
+--- a/src/market_data.py
++++ b/src/market_data.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import threading
+ import time
+@@ -12,6 +13,7 @@ import pandas as pd
+ from config import get, reload as reload_cfg
+ from src.binance_client import BinanceClient, BinanceRESTError
+ from src.cvd import CVDEngine
++from src.external_signals import ExternalSignalTracker
+ from src.footprint import FootprintEngine
+ from src.funding import FundingTracker
+ from src.game_theory import interpret
+@@ -47,6 +49,7 @@ class MarketSession:
+         self.funding = FundingTracker(int(get("buffers.max_funding_rows", 2000)))
+         self.liqs = LiquidationTracker(int(get("buffers.max_liquidations", 3000)))
+         self.structure = PriceStructure()
++        self.external = ExternalSignalTracker(self.symbol)
+         self.scorer = ScoreEngine()
+         self.states = StateMachine()
+         self.ws = WebsocketManager(self._on_ws, self._on_ws_status)
+@@ -89,6 +92,12 @@ class MarketSession:
+             self.timeframe = normalize_interval(timeframe)
+         if self.storage is None:
+             self.storage = Storage()
++        if self.external.symbol != self.symbol:
++            try:
++                self.external.stop()
++            except Exception:
++                pass
++            self.external = ExternalSignalTracker(self.symbol)
+         self._reset_ram()
+         try:
+             self._seed()
+@@ -98,6 +107,7 @@ class MarketSession:
+             raise
+         self.ws.start(self._stream_list())
+         self.ws_book.start(self._depth_stream_list())
++        self.external.start()
+         self.running = True
+         self._poll_thread = threading.Thread(target=self._poll_loop, name="gt-poll", daemon=True)
+         self._score_thread = threading.Thread(target=self._score_loop, name="gt-score", daemon=True)
+@@ -115,6 +125,10 @@ class MarketSession:
+             self.ws_book.stop()
+         except Exception:
+             pass
++        try:
++            self.external.stop()
++        except Exception:
++            pass
+         if self._poll_thread and self._poll_thread.is_alive():
+             self._poll_thread.join(timeout=2)
+         if self._score_thread and self._score_thread.is_alive():
+@@ -412,12 +426,29 @@ class MarketSession:
+                     "cascade_short": scores["cascade_short"],
+                     "state": state,
+                     "price": snap.get("price"),
++                    "components_json": self._components_json(scores),
+                 }
+             )
+             cap = int(get("buffers.max_score_rows", 2500))
+             if len(self.score_hist) > cap:
+                 self.score_hist = self.score_hist[-cap:]
+ 
++    @staticmethod
++    def _components_json(scores: dict) -> str:
++        """Per-component breakdown for both setup sides, for attribution.py.
++        Confirm-layer components are intentionally excluded here: confirm
++        scores gate on structure breaks that are rare/binary and better
++        analyzed via the existing state-transition backtest, not IC."""
++        try:
++            return json.dumps(
++                {
++                    "long_setup": scores["long_setup"]["components"],
++                    "short_setup": scores["short_setup"]["components"],
++                }
++            )
++        except Exception:
++            return "{}"
++
+     def _features(self) -> dict:
+         tf = self.timeframe
+         price = self.trades.last_price or (self.ticker.get("last") if self.ticker else 0.0)
+@@ -442,6 +473,7 @@ class MarketSession:
+         )
+         taker_1m = self.trades.taker_ratio(60_000, "1m")
+         taker_5m = self.trades.taker_ratio(5 * 60_000, "5m")
++        external = self.external.compute(binance_funding=fund_s.get("funding"), binance_price=price)
+         return {
+             "price": price,
+             "change_24h_pct": (self.ticker or {}).get("change_pct", 0.0),
+@@ -474,6 +506,7 @@ class MarketSession:
+             "orderbook": ob_s,
+             "taker_ratio_1m": taker_1m,
+             "taker_ratio_5m": taker_5m,
++            "external": external,
+         }
+ 
+     def _flush(self) -> None:
+@@ -492,6 +525,7 @@ class MarketSession:
+                 "cascade_long": [self.last_scores["cascade_long"]],
+                 "cascade_short": [self.last_scores["cascade_short"]],
+                 "state": [self.states.state],
++                "components_json": [self._components_json(self.last_scores)],
+             }
+             self.storage.upsert_df("scores", pd.DataFrame(row))
+         if self.oi.current:
+diff --git a/src/scoring.py b/src/scoring.py
+index 12fd827..bdc41e1 100644
+--- a/src/scoring.py
++++ b/src/scoring.py
+@@ -428,6 +428,53 @@ class ScoreEngine:
+             )
+         comps.append(_comp("taker_flow", r5, raw, w.get("taker_flow", 10), reason))
+ 
++        # --- cross-exchange funding divergence (Binance vs OKX/Bybit) ---
++        # A crowding/funding read that only exists on Binance (not the rest of
++        # the market) is weaker evidence than one shared across venues.
++        ext = s.get("external") or {}
++        fdiv = ext.get("cross_funding_divergence")
++        if fdiv is None:
++            raw = 0.0
++            reason = ext.get("cross_funding_reason", "no cross-exchange funding data")
++        else:
++            fdiv = float(fdiv)
++            href = float(refs.get("funding_high", 0.0005))
++            if side == "long":
++                raw = clip(fdiv / href) if fdiv > 0 else 0.0
++            else:
++                raw = clip((-fdiv) / href) if fdiv < 0 else 0.0
++            reason = ext.get("cross_funding_reason", "")
++        comps.append(_comp("cross_funding_divergence", fdiv if fdiv is not None else 0.0, raw,
++                            w.get("cross_funding_divergence", 0), reason))
++
++        # --- market regime (BTC dominance momentum + total mcap direction) ---
++        # Coarse context filter from CoinGecko/CMC, not a per-symbol signal:
++        # a long-trap read strengthens if dominance is rising / total mcap is
++        # rolling over (risk-off, alt longs more crowded and more exposed);
++        # a short-trap read strengthens on the mirror case.
++        dom_mom = ext.get("btc_dominance_momentum")
++        mcap_chg = ext.get("total_mcap_chg_24h_pct")
++        if dom_mom is None and mcap_chg is None:
++            raw = 0.0
++            reason = "no aggregator regime data yet (CoinGecko/CoinMarketCap)"
++        else:
++            dom_mom = float(dom_mom or 0.0)
++            mcap_chg = float(mcap_chg or 0.0)
++            if side == "long":
++                raw = clip(0.5 * clip(dom_mom / 0.5) + 0.5 * clip((-mcap_chg) / 2.0))
++                reason = (
++                    f"BTC dominance momentum {dom_mom:+.3f}pp, total mcap 24h {mcap_chg:+.2f}% "
++                    "(dominance up + mcap soft = risk-off, longs more exposed)"
++                )
++            else:
++                raw = clip(0.5 * clip((-dom_mom) / 0.5) + 0.5 * clip(mcap_chg / 2.0))
++                reason = (
++                    f"BTC dominance momentum {dom_mom:+.3f}pp, total mcap 24h {mcap_chg:+.2f}% "
++                    "(dominance down + mcap strong = risk-on, shorts more exposed)"
++                )
++        comps.append(_comp("market_regime", dom_mom if dom_mom is not None else 0.0, raw,
++                            w.get("market_regime", 0), reason))
++
+         total = round(sum(c.points for c in comps), 2)
+         return ScoreCard(total, 100.0, comps)
+ 
+diff --git a/src/storage.py b/src/storage.py
+index 5f9c2e4..59393de 100644
+--- a/src/storage.py
++++ b/src/storage.py
+@@ -52,6 +52,12 @@ _SCHEMA = {
+             short_setup DOUBLE, short_confirm DOUBLE,
+             cascade_long DOUBLE, cascade_short DOUBLE,
+             state VARCHAR,
++            -- JSON-encoded per-component breakdown for both setup sides:
++            -- {"long_setup": [{"name","raw","normalized","weight","points","reason"}, ...],
++            --  "short_setup": [...]}
++            -- Enables per-signal attribution (see attribution.py) without a
++            -- schema migration every time a component is added or removed.
++            components_json VARCHAR,
+             PRIMARY KEY (symbol, ts)
+         )
+     """,
+@@ -88,6 +94,16 @@ class Storage:
+             self.con = duckdb.connect(str(self.db_path))
+         for sql in _SCHEMA.values():
+             self.con.execute(sql)
++        self._migrate()
++
++    def _migrate(self) -> None:
++        """Add columns introduced after a DB file already existed. Safe to
++        run every startup — DuckDB's ADD COLUMN IF NOT EXISTS is a no-op if
++        the column is already there."""
++        try:
++            self.con.execute("ALTER TABLE scores ADD COLUMN IF NOT EXISTS components_json VARCHAR")
++        except Exception:
++            pass
+ 
+     def close(self) -> None:
+         with self._lock:
+diff --git a/tests/test_attribution.py b/tests/test_attribution.py
+new file mode 100644
+index 0000000..d068c47
+--- /dev/null
++++ b/tests/test_attribution.py
+@@ -0,0 +1,108 @@
++import json
++import sys
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.storage import Storage  # noqa: E402
++import attribution  # noqa: E402
++
++
++@pytest.fixture()
++def tmp_storage(tmp_path, monkeypatch):
++    import config
++
++    monkeypatch.setattr(config, "get", config.get)  # keep default resolution
++    st = Storage.__new__(Storage)
++    import duckdb
++
++    st.db_path = tmp_path / "test.duckdb"
++    st.parquet_dir = tmp_path / "parquet"
++    st.parquet_dir.mkdir(parents=True, exist_ok=True)
++    import threading
++
++    st._lock = threading.Lock()
++    st.con = duckdb.connect(str(st.db_path))
++    from src.storage import _SCHEMA
++
++    for sql in _SCHEMA.values():
++        st.con.execute(sql)
++    st._migrate()
++    return st
++
++
++def _make_row(ts, raw_val):
++    components = {
++        "long_setup": [
++            {"name": "fake_signal", "raw": raw_val, "normalized": raw_val, "weight": 10, "points": raw_val * 10, "reason": "x"},
++        ],
++        "short_setup": [
++            {"name": "fake_signal", "raw": raw_val, "normalized": raw_val, "weight": 10, "points": raw_val * 10, "reason": "x"},
++        ],
++    }
++    return {
++        "symbol": "BTCUSDT",
++        "ts": ts,
++        "long_setup": 50.0,
++        "long_confirm": 0.0,
++        "short_setup": 50.0,
++        "short_confirm": 0.0,
++        "cascade_long": 0.0,
++        "cascade_short": 0.0,
++        "state": "NEUTRAL",
++        "components_json": json.dumps(components),
++    }
++
++
++def test_attribution_finds_signal_correlated_with_forward_return(tmp_storage, monkeypatch):
++    # Build 15m candles that go DOWN whenever fake_signal was high (raw~1)
++    # and stay FLAT when fake_signal was low (raw~0), so a long_setup
++    # component with raw~1 should show a positive IC (it predicted the
++    # adverse-for-longs move) once the sign convention is applied.
++    base_ts = 1_700_000_000_000
++    step = 15 * 60_000
++    rows = []
++    price = 100.0
++    for i in range(30):
++        ts = base_ts + i * step
++        raw = 1.0 if i % 2 == 0 else 0.0
++        rows.append(_make_row(ts, raw))
++        # Candle close AT ts reflects price before today's signal has had any
++        # effect; the drop associated with `raw` shows up in the NEXT candle,
++        # i.e. in the forward return measured FROM ts. This is what makes
++        # `raw` predictive of the forward move rather than concurrent with it.
++        rows.append({"open_time": ts, "close": price})
++        price = price * (0.98 if raw == 1.0 else 1.0)
++
++    scores_df = pd.DataFrame([r for r in rows if "components_json" in r])
++    candles_df = pd.DataFrame([r for r in rows if "open_time" in r])
++    candles_df["symbol"] = "BTCUSDT"
++    candles_df["interval"] = "15m"
++    candles_df["open"] = candles_df["close"]
++    candles_df["high"] = candles_df["close"]
++    candles_df["low"] = candles_df["close"]
++    candles_df["volume"] = 0.0
++    candles_df["closed"] = True
++
++    tmp_storage.upsert_df("scores", scores_df)
++    tmp_storage.upsert_df(
++        "candles",
++        candles_df[["symbol", "interval", "open_time", "open", "high", "low", "close", "volume", "closed"]],
++    )
++
++    monkeypatch.setattr(attribution, "Storage", lambda: tmp_storage)
++    out = attribution.attribute("BTCUSDT", "long")
++    assert not out.empty
++    row = out[out["component"] == "fake_signal"].iloc[0]
++    # raw=1 preceded price DOWN -> for long_setup (trap/vulnerability score)
++    # that is the intended direction -> IC should be meaningfully positive.
++    assert row["ic_spearman_15m"] > 0.3
++
++
++def test_attribution_empty_when_no_scores(tmp_storage, monkeypatch):
++    monkeypatch.setattr(attribution, "Storage", lambda: tmp_storage)
++    out = attribution.attribute("BTCUSDT", "long")
++    assert out.empty
+diff --git a/tests/test_scoring.py b/tests/test_scoring.py
+index f6aa5df..1b540d0 100644
+--- a/tests/test_scoring.py
++++ b/tests/test_scoring.py
+@@ -44,7 +44,7 @@ def test_neutral_scores_low():
+     out = ScoreEngine().compute(_base())
+     assert 0 <= out["long_setup"]["total"] <= 40
+     assert out["long_setup"]["total"] + 1e-9 >= 0
+-    assert len(out["long_setup"]["components"]) == 9
++    assert len(out["long_setup"]["components"]) == 11
+ 
+ 
+ def test_long_trap_setup_rises_with_crowding_and_div():
+@@ -62,7 +62,11 @@ def test_long_trap_setup_rises_with_crowding_and_div():
+                        "failed_breakout": True, "failed_breakdown": False, "reason": "high"},
+         )
+     )
+-    assert out["long_setup"]["total"] > 60
++    # Threshold lowered from 60 -> 50: adding cross_funding_divergence and
++    # market_regime (weight 5 each) trimmed the other components' weights
++    # further, and both new components score 0 here (no external data in
++    # this fixture) — see attribution.py for how to validate their weight.
++    assert out["long_setup"]["total"] > 50
+     assert out["long_setup"]["total"] > out["short_setup"]["total"]
+ 
+ 
+@@ -94,7 +98,7 @@ def test_weights_sum_displayed():
+     w = sum(c["weight"] for c in out["long_setup"]["components"])
+     ps = next(c for c in out["long_setup"]["components"] if c["name"] == "price_structure")
+     assert ps["weight"] == 3
+-    assert abs(w - 98) < 1e-6
++    assert abs(w - 100) < 1e-6
+ 
+ 
+ def test_book_imbalance_raises_long_setup_only_with_thin_wall():
+@@ -182,3 +186,40 @@ def test_top_pos_ratio_missing_is_neutral_not_crash():
+     c = crowding_breakdown(_base(funding_pctile=50, ls_account_ratio=1.0, top_pos_ratio=None))
+     assert abs(c["long_100"] - 50.0) < 1e-6
+     assert "missing" in c["long_reason"]
++
++
++def test_external_signals_missing_scores_zero_not_crash():
++    """No 'external' key at all (older snapshot shape / tracker not started
++    yet) must not crash scoring and must not fabricate a neutral 50."""
++    out = ScoreEngine().compute(_base())
++    cf = next(c for c in out["long_setup"]["components"] if c["name"] == "cross_funding_divergence")
++    mr = next(c for c in out["long_setup"]["components"] if c["name"] == "market_regime")
++    assert cf["points"] == 0
++    assert mr["points"] == 0
++    assert "no cross-exchange funding data" in cf["reason"]
++    assert "no aggregator regime data" in mr["reason"]
++
++
++def test_cross_funding_divergence_favors_long_when_binance_hotter():
++    out = ScoreEngine().compute(
++        _base(external={
++            "cross_funding_divergence": 0.0008,
++            "cross_funding_reason": "Binance funding hotter than OKX/Bybit",
++        })
++    )
++    long_c = next(c for c in out["long_setup"]["components"] if c["name"] == "cross_funding_divergence")
++    short_c = next(c for c in out["short_setup"]["components"] if c["name"] == "cross_funding_divergence")
++    assert long_c["points"] > 0
++    assert short_c["points"] == 0
++
++
++def test_market_regime_favors_long_setup_when_dominance_up_mcap_soft():
++    out = ScoreEngine().compute(
++        _base(external={
++            "btc_dominance_momentum": 0.6,
++            "total_mcap_chg_24h_pct": -1.5,
++        })
++    )
++    long_c = next(c for c in out["long_setup"]["components"] if c["name"] == "market_regime")
++    short_c = next(c for c in out["short_setup"]["components"] if c["name"] == "market_regime")
++    assert long_c["points"] > short_c["points"]

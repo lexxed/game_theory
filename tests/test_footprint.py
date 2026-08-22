@@ -4,6 +4,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.footprint import FootprintEngine
+from src.utils import format_elapsed
+
+
+def test_format_elapsed():
+    assert format_elapsed(0) == "0m 00s"
+    assert format_elapsed(7) == "0m 07s"
+    assert format_elapsed(65) == "1m 05s"
+    assert format_elapsed(3725) == "1h 02m 05s"
 
 
 def test_buckets_and_delta():
@@ -92,6 +100,17 @@ def test_fp_html_does_not_collapse_red_levels():
     assert "0.10000" in html
     assert "tickSize=" in html
     assert "bucket=" in html
+    html_oi = _fp_html(
+        rows,
+        tick_size=0.00001,
+        bucket=0.00001,
+        oi_chg_1m_pct=0.02,
+        oi_chg_5m_pct=-0.10,
+        oi_chg_15m_pct=-0.25,
+    )
+    assert "OI (whole contract, not per price)" in html_oi
+    assert "UP" in html_oi
+    assert "DOWN" in html_oi
 
 
 def test_bucket_is_tick_times_multiplier():

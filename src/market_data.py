@@ -69,6 +69,8 @@ class MarketSession:
         self._poll_thread: threading.Thread | None = None
         self._score_thread: threading.Thread | None = None
         self.running = False
+        self.started_at: float | None = None
+        self.stopped_at: float | None = None
         self.last_scores: dict = {}
         self.score_hist: list[dict] = []
         self.status: dict[str, dict] = {
@@ -98,6 +100,8 @@ class MarketSession:
             raise
         self.ws.start(self._stream_list())
         self.ws_book.start(self._depth_stream_list())
+        self.started_at = time.time()
+        self.stopped_at = None
         self.running = True
         self._poll_thread = threading.Thread(target=self._poll_loop, name="gt-poll", daemon=True)
         self._score_thread = threading.Thread(target=self._score_loop, name="gt-score", daemon=True)
@@ -105,7 +109,10 @@ class MarketSession:
         self._score_thread.start()
 
     def stop(self) -> None:
+        was_running = self.running
         self._stop.set()
+        if was_running and self.started_at:
+            self.stopped_at = time.time()
         self.running = False
         try:
             self.ws.stop()
@@ -610,6 +617,13 @@ class MarketSession:
                 "symbol": self.symbol,
                 "timeframe": self.timeframe,
                 "running": self.running,
+                "started_at": self.started_at,
+                "stopped_at": self.stopped_at,
+                "uptime_s": (
+                    ((self.stopped_at or time.time()) - self.started_at)
+                    if self.started_at
+                    else 0.0
+                ),
                 "meta": self.meta,
                 "features": feat,
                 "scores": scores,

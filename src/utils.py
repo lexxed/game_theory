@@ -18,6 +18,18 @@ def now_s() -> float:
     return time.time()
 
 
+def format_elapsed(seconds: float | None) -> str:
+    """Human session uptime, e.g. 3m 07s or 1h 02m 05s."""
+    if seconds is None or seconds != seconds or seconds < 0:
+        return "0m 00s"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {sec:02d}s"
+    return f"{m}m {sec:02d}s"
+
+
 def clip(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     if x != x:  # NaN
         return 0.0

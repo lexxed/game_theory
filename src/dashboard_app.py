@@ -62,6 +62,8 @@ def format_copy_snapshot(snap: dict, symbol_override: str = "", grok_comment: st
         f"SYMBOL  {symbol}   TF  {snap.get('timeframe')}",
         f"STATE   {snap.get('state')}",
         f"REASON  {snap.get('state_reason')}",
+        f"SESSION {'RUNNING' if snap.get('running') else 'STOPPED'}  "
+        f"{_session_elapsed_label(snap)}",
         "",
         "KPIs",
         f"  PRICE           {float(f.get('price') or 0):.4f}",
@@ -135,6 +137,30 @@ def _to_clipboard(text: str) -> str:
 
 def _yn(flag: bool) -> str:
     return "YES" if flag else "NO"
+
+
+def _session_elapsed_label(snap: dict) -> str:
+    from src.utils import format_elapsed, now_s
+
+    started = snap.get("started_at")
+    if not started:
+        return "not started"
+    end = snap.get("stopped_at") if not snap.get("running") else now_s()
+    return format_elapsed(float(end) - float(started))
+
+
+def _session_html(snap: dict) -> str:
+    running = bool(snap.get("running"))
+    color = "#0a0" if running else "#888"
+    label = "RUNNING" if running else "STOPPED"
+    elapsed = _session_elapsed_label(snap)
+    return (
+        f"<div style='font-family:Segoe UI,system-ui,sans-serif;font-size:14px;margin:6px 0'>"
+        f"<b>SESSION</b> <span style='color:{color};font-weight:650'>{label}</span> "
+        f"&nbsp; {elapsed}"
+        f"<span style='color:#666;font-size:12px'> &nbsp; (resets on START)</span>"
+        f"</div>"
+    )
 
 
 def _gates_html(s: dict) -> str:
@@ -290,6 +316,18 @@ def _score_html(title: str, setup: dict, confirm: dict, state: str) -> str:
     """
 
 
+def _oi_dir_label(pct) -> str:
+    try:
+        v = float(pct)
+    except (TypeError, ValueError):
+        return "n/a"
+    if v > 1e-9:
+        return f"UP {v:+.3f}%"
+    if v < -1e-9:
+        return f"DOWN {v:+.3f}%"
+    return f"FLAT {v:+.3f}%"
+
+
 def _fp_html(
     rows: list[dict],
     n: int = 18,
@@ -298,6 +336,9 @@ def _fp_html(
     bucket: float | None = None,
     tick_mult: int | None = None,
     tick_raw: str | None = None,
+    oi_chg_1m_pct=None,
+    oi_chg_5m_pct=None,
+    oi_chg_15m_pct=None,
 ) -> str:
     from src.utils import format_price_level
 
@@ -310,6 +351,12 @@ def _fp_html(
     tick_line = (
         f"<span style='color:#555;font-size:11px'>tickSize={tick_s} × multiplier={mult} "
         f"→ bucket={bucket_s}</span>"
+        f"<br><span style='color:#555;font-size:11px'>"
+        f"OI (whole contract, not per price) &nbsp; "
+        f"1m {_oi_dir_label(oi_chg_1m_pct)} &nbsp;|&nbsp; "
+        f"5m {_oi_dir_label(oi_chg_5m_pct)} &nbsp;|&nbsp; "
+        f"15m {_oi_dir_label(oi_chg_15m_pct)}"
+        f"</span>"
     )
     if not rows:
         return (
@@ -437,6 +484,7 @@ class Dashboard:
             placeholder="Click Copy snapshot to fill this box (and the clipboard).",
             layout=W.Layout(width="100%", height="180px"),
         )
+        self.session_box = W.HTML("<i>SESSION not started — click START.</i>")
         self.health = W.HTML()
         self.kpis = W.HTML()
         self.gates_box = W.HTML()
@@ -490,6 +538,7 @@ class Dashboard:
                        "<div style='color:#444'>Public market data only. No orders. "
                        "Scores are deterministic. High score ≠ prediction.</div>"),
                 controls,
+                self.session_box,
                 self.health,
                 self.kpis,
                 self.gates_box,
@@ -550,6 +599,10 @@ class Dashboard:
         if self._timer:
             self._timer.cancel()
             self._timer = None
+        try:
+            self.refresh()
+        except Exception:
+            pass
         self.log.value = "Stopped."
 
     def _on_backtest(self, _=None) -> None:
@@ -638,6 +691,7 @@ class Dashboard:
 
     def refresh(self) -> None:
         snap = self.engine.snapshot()
+        self.session_box.value = _session_html(snap)
         self.health.value = _health_html(snap.get("health") or {})
         self.kpis.value = _kpi_html(snap)
         self.gates_box.value = _gates_html(snap)
@@ -649,12 +703,17 @@ class Dashboard:
         self.game.value = f"<div style='font-family:Segoe UI,system-ui,sans-serif;font-size:13px;line-height:1.35'>{nar}</div>"
         fm = snap.get("footprint_meta") or {}
         meta = snap.get("meta") or {}
+        feat = snap.get("features") or {}
+        oi = feat.get("oi") or {}
         self.fp.value = _fp_html(
             snap.get("footprint") or [],
             tick_size=float(fm.get("tick_size") or meta.get("tickSize") or 0.0),
             bucket=float(fm.get("bucket") or 0.0),
             tick_mult=int(fm.get("tick_multiplier") or 1),
             tick_raw=meta.get("tickSize_raw"),
+            oi_chg_1m_pct=feat.get("oi_chg_1m_pct", oi.get("chg_1m_pct")),
+            oi_chg_5m_pct=feat.get("oi_chg_5m_pct", oi.get("chg_5m_pct")),
+            oi_chg_15m_pct=feat.get("oi_chg_15m_pct", oi.get("chg_15m_pct")),
         )
         now = time.time()
         if now - self._last_chart >= 2.0:
